@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="516" viewBox="0 0 800 516" role="img" aria-label="minion: the nudge reaches the model at the next step">
+<rect width="800" height="516" rx="8" fill="#1b1d23"/>
+<circle cx="18" cy="17" r="5.5" fill="#ff5f57"/><circle cx="36" cy="17" r="5.5" fill="#febc2e"/><circle cx="54" cy="17" r="5.5" fill="#28c840"/>
+<text x="400.0" y="21" text-anchor="middle" fill="#8b919c" font-family="sans-serif" font-size="12">minion: the nudge reaches the model at the next step</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" xml:space="preserve">
+<text x="30.8" y="47" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="47.6" y="47" fill="#d8dce3" textLength="462.0" lengthAdjust="spacingAndGlyphs">test_keeps_valid (test_names.T.test_keeps_valid) ... ok</text>
+<text x="30.8" y="65" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="47.6" y="65" fill="#d8dce3" textLength="378.0" lengthAdjust="spacingAndGlyphs">test_strips (test_names.T.test_strips) ... ok</text>
+<text x="30.8" y="83" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="30.8" y="101" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="47.6" y="101" fill="#d8dce3" textLength="588.0" lengthAdjust="spacingAndGlyphs">----------------------------------------------------------------------</text>
+<text x="30.8" y="119" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="47.6" y="119" fill="#d8dce3" textLength="176.4" lengthAdjust="spacingAndGlyphs">Ran 3 tests in 0.000s</text>
+<text x="30.8" y="137" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="30.8" y="155" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="47.6" y="155" fill="#d8dce3" textLength="16.8" lengthAdjust="spacingAndGlyphs">OK</text>
+<text x="30.8" y="173" fill="#56b6c2" textLength="16.8" lengthAdjust="spacingAndGlyphs">└─</text>
+<text x="30.8" y="191" fill="#c678dd" textLength="344.4" lengthAdjust="spacingAndGlyphs">↳ nudge: also cover the empty string case</text>
+<text x="30.8" y="227" fill="#d8dce3" font-weight="bold" textLength="33.6" lengthAdjust="spacingAndGlyphs">Done</text>
+<text x="30.8" y="263" fill="#d8dce3" textLength="487.2" lengthAdjust="spacingAndGlyphs">All tests pass. Per your note, I also added a test for the</text>
+<text x="526.4" y="263" fill="#d8dce3" font-weight="bold" textLength="100.8" lengthAdjust="spacingAndGlyphs">empty string</text>
+<text x="627.2" y="263" fill="#d8dce3" textLength="8.4" lengthAdjust="spacingAndGlyphs">:</text>
+<text x="39.2" y="299" fill="#448493" textLength="25.2" lengthAdjust="spacingAndGlyphs">def</text>
+<text x="72.8" y="299" fill="#678929" textLength="142.8" lengthAdjust="spacingAndGlyphs">test_empty_string</text>
+<text x="215.6" y="299" fill="#949594" textLength="58.8" lengthAdjust="spacingAndGlyphs">(self):</text>
+<text x="72.8" y="317" fill="#448493" textLength="33.6" lengthAdjust="spacingAndGlyphs">with</text>
+<text x="106.4" y="317" fill="#949594" textLength="42.0" lengthAdjust="spacingAndGlyphs"> self</text>
+<text x="148.4" y="317" fill="#98335b" textLength="8.4" lengthAdjust="spacingAndGlyphs">.</text>
+<text x="156.8" y="317" fill="#949594" textLength="109.2" lengthAdjust="spacingAndGlyphs">assertRaises(</text>
+<text x="266.0" y="317" fill="#678929" textLength="84.0" lengthAdjust="spacingAndGlyphs">ValueError</text>
+<text x="350.0" y="317" fill="#949594" textLength="16.8" lengthAdjust="spacingAndGlyphs">):</text>
+<text x="39.2" y="335" fill="#949594" textLength="159.6" lengthAdjust="spacingAndGlyphs">        parse_name(</text>
+<text x="198.8" y="335" fill="#8a854f" textLength="16.8" lengthAdjust="spacingAndGlyphs">&quot;&quot;</text>
+<text x="215.6" y="335" fill="#949594" textLength="8.4" lengthAdjust="spacingAndGlyphs">)</text>
+<text x="39.2" y="371" fill="#e5c07b" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs">•</text>
+<text x="56.0" y="371" fill="#56b6c2" font-weight="bold" textLength="168.0" lengthAdjust="spacingAndGlyphs">parse_name(&quot;  ada &quot;)</text>
+<text x="232.4" y="371" fill="#d8dce3" textLength="8.4" lengthAdjust="spacingAndGlyphs">→</text>
+<text x="249.2" y="371" fill="#56b6c2" font-weight="bold" textLength="42.0" lengthAdjust="spacingAndGlyphs">&quot;ada&quot;</text>
+<text x="39.2" y="389" fill="#e5c07b" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs">•</text>
+<text x="56.0" y="389" fill="#56b6c2" font-weight="bold" textLength="117.6" lengthAdjust="spacingAndGlyphs">parse_name(&quot;&quot;)</text>
+<text x="182.0" y="389" fill="#d8dce3" textLength="25.2" lengthAdjust="spacingAndGlyphs">and</text>
+<text x="215.6" y="389" fill="#56b6c2" font-weight="bold" textLength="142.8" lengthAdjust="spacingAndGlyphs">parse_name(&quot;   &quot;)</text>
+<text x="366.8" y="389" fill="#d8dce3" textLength="8.4" lengthAdjust="spacingAndGlyphs">→</text>
+<text x="383.6" y="389" fill="#56b6c2" font-weight="bold" textLength="84.0" lengthAdjust="spacingAndGlyphs">ValueError</text>
+<text x="30.8" y="425" fill="#82868c" textLength="302.4" lengthAdjust="spacingAndGlyphs">└ ≈72 tok ·  62.5 tok/s ·  1.2s wall</text>
+<text x="14.0" y="461" fill="#82868c" textLength="16.8" lengthAdjust="spacingAndGlyphs">╭─</text>
+<text x="39.2" y="461" fill="#56b6c2" textLength="25.2" lengthAdjust="spacingAndGlyphs">you</text>
+<text x="72.8" y="461" fill="#82868c" textLength="697.2" lengthAdjust="spacingAndGlyphs">· Enter send · Alt+Enter / ^J newline · ^C cancel ────────────────────────────────╮</text>
+<text x="14.0" y="479" fill="#82868c" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="761.6" y="479" fill="#82868c" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="14.0" y="497" fill="#82868c" textLength="756.0" lengthAdjust="spacingAndGlyphs">╰─ 1 line · 0 chars                                                                      ╯</text>
+</g></svg>

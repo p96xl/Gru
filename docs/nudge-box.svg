@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="516" viewBox="0 0 800 516" role="img" aria-label="minion: typing a nudge while the agent works">
+<rect width="800" height="516" rx="8" fill="#1b1d23"/>
+<circle cx="18" cy="17" r="5.5" fill="#ff5f57"/><circle cx="36" cy="17" r="5.5" fill="#febc2e"/><circle cx="54" cy="17" r="5.5" fill="#28c840"/>
+<text x="400.0" y="21" text-anchor="middle" fill="#8b919c" font-family="sans-serif" font-size="12">minion: typing a nudge while the agent works</text>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" xml:space="preserve">
+<text x="14.0" y="47" fill="#d8dce3" font-weight="bold" textLength="50.4" lengthAdjust="spacingAndGlyphs">minion</text>
+<text x="72.8" y="47" fill="#82868c" textLength="8.4" lengthAdjust="spacingAndGlyphs">·</text>
+<text x="89.6" y="47" fill="#56b6c2" textLength="84.0" lengthAdjust="spacingAndGlyphs">demo-model</text>
+<text x="182.0" y="47" fill="#82868c" textLength="8.4" lengthAdjust="spacingAndGlyphs">·</text>
+<text x="198.8" y="47" fill="#98c379" textLength="33.6" lengthAdjust="spacingAndGlyphs">yolo</text>
+<text x="240.8" y="47" fill="#82868c" textLength="235.2" lengthAdjust="spacingAndGlyphs">· http://127.0.0.1:18990/v1/</text>
+<text x="14.0" y="101" fill="#82868c" textLength="16.8" lengthAdjust="spacingAndGlyphs">╭─</text>
+<text x="39.2" y="101" fill="#56b6c2" textLength="25.2" lengthAdjust="spacingAndGlyphs">you</text>
+<text x="72.8" y="101" fill="#82868c" textLength="697.2" lengthAdjust="spacingAndGlyphs">· Enter send · Alt+Enter / ^J newline · ^C cancel ────────────────────────────────╮</text>
+<text x="14.0" y="119" fill="#82868c" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="22.4" y="119" fill="#d8dce3" textLength="445.2" lengthAdjust="spacingAndGlyphs">validate the name in parse_name(): reject empty input</text>
+<text x="761.6" y="119" fill="#82868c" textLength="8.4" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="14.0" y="137" fill="#82868c" textLength="756.0" lengthAdjust="spacingAndGlyphs">╰─ 1 line · 53 chars                                                                     ╯</text>
+<text x="30.8" y="191" fill="#82868c" textLength="92.4" lengthAdjust="spacingAndGlyphs">╭─ thinking</text>
+<text x="30.8" y="209" fill="#82868c" textLength="756.0" lengthAdjust="spacingAndGlyphs">│ The user wants input validation for parse_name(). Empty and whitespace-only names should</text>
+<text x="30.8" y="227" fill="#82868c" textLength="722.4" lengthAdjust="spacingAndGlyphs">│ raise ValueError, and the existing tests must keep passing. I&#x27;ll outline the change,</text>
+<text x="30.8" y="245" fill="#82868c" textLength="420.0" lengthAdjust="spacingAndGlyphs">│ then run the test suite to confirm the baseline.</text>
+<text x="30.8" y="263" fill="#82868c" textLength="142.8" lengthAdjust="spacingAndGlyphs">╰─ thought for 2s</text>
+<text x="30.8" y="299" fill="#d8dce3" font-weight="bold" text-decoration="underline" textLength="33.6" lengthAdjust="spacingAndGlyphs">Plan</text>
+<text x="39.2" y="335" fill="#e5c07b" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs">1</text>
+<text x="56.0" y="335" fill="#d8dce3" font-weight="bold" textLength="67.2" lengthAdjust="spacingAndGlyphs">Validate</text>
+<text x="131.6" y="335" fill="#d8dce3" textLength="92.4" lengthAdjust="spacingAndGlyphs">the name in</text>
+<text x="232.4" y="335" fill="#56b6c2" font-weight="bold" textLength="100.8" lengthAdjust="spacingAndGlyphs">parse_name()</text>
+<text x="333.2" y="335" fill="#d8dce3" textLength="176.4" lengthAdjust="spacingAndGlyphs">: strip it, and raise</text>
+<text x="518.0" y="335" fill="#56b6c2" font-weight="bold" textLength="84.0" lengthAdjust="spacingAndGlyphs">ValueError</text>
+<text x="610.4" y="335" fill="#d8dce3" textLength="176.4" lengthAdjust="spacingAndGlyphs">when nothing is left.</text>
+<text x="39.2" y="353" fill="#e5c07b" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs">2</text>
+<text x="56.0" y="353" fill="#d8dce3" font-weight="bold" textLength="33.6" lengthAdjust="spacingAndGlyphs">Keep</text>
+<text x="98.0" y="353" fill="#d8dce3" textLength="470.4" lengthAdjust="spacingAndGlyphs">valid names unchanged, so existing callers don&#x27;t notice.</text>
+<text x="39.2" y="371" fill="#e5c07b" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs">3</text>
+<text x="56.0" y="371" fill="#d8dce3" font-weight="bold" textLength="25.2" lengthAdjust="spacingAndGlyphs">Run</text>
+<text x="89.6" y="371" fill="#d8dce3" textLength="361.2" lengthAdjust="spacingAndGlyphs">the test suite before and after the change.</text>
+<text x="30.8" y="389" fill="#d8dce3" textLength="58.8" lengthAdjust="spacingAndGlyphs">Running</text>
+<text x="14.0" y="479" fill="#82868c" textLength="764.4" lengthAdjust="spacingAndGlyphs">── nudge · Enter sends it at the next step · Esc interrupts ───────────────────────────────</text>
+<text x="14.0" y="497" fill="#56b6c2" textLength="8.4" lengthAdjust="spacingAndGlyphs">›</text>
+<text x="30.8" y="497" fill="#d8dce3" textLength="268.8" lengthAdjust="spacingAndGlyphs">also cover the empty string case</text>
+</g></svg>

@@ -2,6 +2,60 @@
 
 ![minion](minion.png)
 
+> **This is a fork of [sentdex/minion](https://github.com/sentdex/minion).** It adds the four
+> changes below. Each one also lives on its own branch, based on upstream `master` and
+> independent of the others, so it can be reviewed and merged on its own.
+
+## What this fork adds
+
+### Steer the agent while it works
+
+While minion is working, a nudge box stays pinned to the bottom of the terminal and the
+output scrolls above it. Type a correction at any time and press **Enter**: it reaches the
+model at the next step, usually right after the current tool call returns, without
+stopping the run. If the model finishes while a nudge is queued, it keeps going and
+answers it. **Esc** still interrupts, and anything unsent is waiting in the chat input
+afterwards. Half-typed text can never answer an approval prompt.
+
+![Typing a nudge while minion works](docs/nudge-box.svg)
+
+![The nudge is delivered after the tool call, and the model picks it up](docs/nudge-delivered.svg)
+
+<sub>Scripted demo: real minion and a real test run, with a mock model server playing the
+model so the screenshots are reproducible.</sub>
+
+Turn it off with `MINION_LIVE_INPUT=0`. More in [Steering while it works](#steering-while-it-works).
+Branch: [`feat/live-nudge`](https://github.com/p96xl/minion/tree/feat/live-nudge).
+
+### Answers rendered as Markdown
+
+With the optional `pretty` extra (`pip install -e '.[pretty]'`), answers stream as rendered
+Markdown: headings, lists, tables and syntax-highlighted code, as in the second screenshot.
+Reasoning is dimmed behind a bar and ends with how long the model thought. Without `rich`,
+without a terminal, or with `MINION_PLAIN=1`, output is the plain text it always was.
+Branch: [`feat/markdown-rendering`](https://github.com/p96xl/minion/tree/feat/markdown-rendering)
+(includes the whitespace fix below, which it needs).
+
+### Fixes
+
+- **Lost line breaks and spaces.** Whitespace-only stream chunks were dropped, so models
+  whose tokenizers send newlines as separate tokens (Qwen) lost every line break, on screen
+  and in history ("an 800x500" became "an800x500").
+  Branch: [`fix/stream-whitespace`](https://github.com/p96xl/minion/tree/fix/stream-whitespace).
+- **Esc did nothing while a command ran.** `run_bash` checks for Esc so you can stop waiting
+  on a slow command, but nothing was reading the keyboard at that point, so minion sat
+  through the whole wait. Now Esc stops the wait and the command keeps running in the
+  background. Branch: [`fix/esc-during-run-bash`](https://github.com/p96xl/minion/tree/fix/esc-during-run-bash).
+
+To run this fork with everything included:
+
+```
+git clone https://github.com/p96xl/minion && cd minion
+pip install -e '.[pretty]'
+```
+
+---
+
 A no-nonsense coding agent that doesn't use 50K tokens of context to say "hello."
 
 Minion is a purpose built coding agent aimed at removing and keeping out context bloat. Many agent frameworks use 20K-50K+ tokens when you've just said "hey." This is caused by having a lot of features and tools that need to be loaded into the context of the LLM.
