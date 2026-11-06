@@ -2,6 +2,17 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — Markdown rendering of streamed output (optional, `rich`)
+
+With the optional `pretty` extra installed (`pip install -e '.[pretty]'`),
+answers are rendered as Markdown while they stream: headings, lists, tables and
+syntax-coloured code blocks. Each finished block (paragraph, list, table, code
+fence) is printed for good; the block still being written shows in a small live
+area below it, cropped to the screen height. Reasoning is shown dimmed behind a
+`│` bar and closed with how long the model thought. Falls back to the old plain
+output when rich isn't installed, stdout isn't a terminal, or `MINION_PLAIN=1`.
+`MINION_CODE_THEME` picks the Pygments style for code.
+
 ### Fixed — whitespace-only stream chunks were dropped
 
 Streamed reasoning and answer chunks were only printed and kept when

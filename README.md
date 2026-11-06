@@ -84,6 +84,16 @@ That registers a `minion` console script pointing at this checkout — edits you
 make here are picked up immediately. Use `pip install .` (no `-e`) for a
 non-editable install instead.
 
+For Markdown-rendered output (headings, lists, tables, syntax-coloured code
+blocks, reasoning in a dimmed box) add the optional `pretty` extra, which pulls
+in [rich](https://github.com/Textualize/rich):
+
+```
+pip install -e '.[pretty]'
+```
+
+Without rich, or when stdout isn't a terminal, minion prints plain text as before.
+
 ## Configuration
 
 minion reads configuration from environment variables, and automatically loads
@@ -249,6 +259,8 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
 | `MINION_RISK_RETRY_SECONDS` | seconds to wait between command-risk classifier connection retries (default 1) |
 | `MINION_SESSION_DESC_REFRESH` | refresh the model-generated session description every N turns (default 6; `0` disables) |
+| `MINION_PLAIN` | `1` prints streamed output as plain text even when rich is installed |
+| `MINION_CODE_THEME` | Pygments style for code blocks in rendered output (default `monokai`) |
 | `MINION_METRICS_URL` | optional endpoint to receive cumulative token-usage totals after each turn (default unset; see Metrics) |
 
 ## Subcommands

@@ -1223,6 +1223,201 @@ HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
 
 
+# --- pretty streaming output ------------------------------------------------
+# Reasoning and answers are rendered as Markdown with rich, one finished block
+# (paragraph, list, table, code fence) at a time: a finished block is printed
+# for good, the block still being written shows in a small live area under it.
+# Reasoning sits behind a dim "│" bar and closes with how long it took.
+# Plain text, as before, when rich is missing, stdout isn't a terminal, or
+# MINION_PLAIN=1. MINION_CODE_THEME picks the code colours (a Pygments style).
+try:
+    from rich.console import Console as _RichConsole
+    from rich.live import Live as _RichLive
+    from rich.markdown import Heading as _RichHeading, Markdown as _RichMarkdown
+    from rich.segment import Segment as _RichSegment
+    from rich.text import Text as _RichText
+except ImportError:
+    _RichConsole = None
+
+_PRETTY = (_RichConsole is not None and sys.stdout.isatty()
+           and os.environ.get("MINION_PLAIN", "").strip().lower() not in ("1", "true", "yes"))
+_CODE_THEME = os.environ.get("MINION_CODE_THEME", "monokai")
+_FENCE_RE = re.compile(r"(`{3,}|~{3,})")
+
+
+if _RichConsole is not None:
+    class _LeftHeading(_RichHeading):
+        """rich centres headings (h1 in a box); a terminal reads better left-aligned."""
+
+        def __rich_console__(self, console, options):
+            self.text.justify = "left"
+            yield self.text
+
+    class _Md(_RichMarkdown):
+        elements = {**_RichMarkdown.elements, "heading_open": _LeftHeading}
+
+
+class _Gutter:
+    """A renderable drawn narrower, each line behind a fixed prefix."""
+
+    def __init__(self, renderable, bar, style="dim"):
+        self.renderable, self.bar, self.style = renderable, bar, style
+
+    def __rich_console__(self, console, options):
+        width = max(20, options.max_width - len(self.bar))
+        lines = console.render_lines(self.renderable, options.update(width=width), pad=False)
+        bar = _RichSegment(self.bar, console.get_style(self.style))
+        for line in lines:   # each line ends with a newline: console.print adds none
+            yield bar
+            yield from line
+            yield _RichSegment.line()
+
+
+class _Lines:
+    """Already-rendered lines (for the live area, which shows only the tail)."""
+
+    def __init__(self, lines, end=False):
+        self.lines, self.end = lines, end
+
+    def __rich_console__(self, console, options):
+        for i, line in enumerate(self.lines):
+            yield from line
+            if self.end or i < len(self.lines) - 1:
+                yield _RichSegment.line()
+
+
+class _StreamView:
+    """Shows one streamed turn: think() for reasoning, say() for the answer,
+    end() before anything else prints (tool status, warnings, footer)."""
+
+    BARS = {"think": "  │ ", "say": "  "}
+
+    def __init__(self):
+        self.console = _RichConsole(highlight=False) if _PRETTY else None
+        self.kind = None
+        self.buf = ""
+        self.live = None
+        self.t_start = 0.0
+        self.last_paint = 0.0
+        self.blocks = 0
+
+    def think(self, text):
+        self._feed("think", text)
+
+    def say(self, text):
+        self._feed("say", text)
+
+    def _feed(self, kind, text):
+        if kind != self.kind:
+            self.end()
+            self._open(kind)
+        if self.console is None:
+            print(f"{DIM if kind == 'think' else GREEN}{text}{RESET}", end="", flush=True)
+            return
+        self.buf += text
+        cut = self._last_boundary(self.buf)
+        if cut:
+            done, self.buf = self.buf[:cut], self.buf[cut:]
+            self._commit(done)
+            self._paint(force=True)
+        else:
+            self._paint()
+
+    def _open(self, kind):
+        self.kind, self.buf, self.blocks = kind, "", 0
+        self.t_start = time.time()
+        if self.console is None:
+            if kind == "think":
+                print(f"{DIM}  ── reasoning ──{RESET}")
+            return
+        self.console.print()
+        if kind == "think":
+            self.console.print(_RichText("  ╭─ thinking", style="dim"))
+        self.live = _RichLive(console=self.console, auto_refresh=False, transient=True,
+                              redirect_stdout=False, redirect_stderr=False)
+        self.live.start()
+
+    def end(self):
+        """Finish the open block, if any. Safe to call any number of times."""
+        kind, self.kind = self.kind, None
+        if kind is None:
+            return
+        if self.console is None:
+            print()
+            if kind == "think":
+                print(f"{DIM}  ──────────────{RESET}")
+            return
+        try:
+            self._commit(self.buf, kind)
+            self.buf = ""
+            self.live.update(_RichText(""), refresh=True)
+        finally:
+            self.live.stop()
+            self.live = None
+        if kind == "think":
+            secs = time.time() - self.t_start
+            self.console.print(_RichText(f"  ╰─ thought for {secs:.0f}s", style="dim"))
+
+    def _render(self, text, kind):
+        md = _Md(text.strip("\n"), code_theme=_CODE_THEME, hyperlinks=False,
+                           style="dim" if kind == "think" else "none")
+        return _Gutter(md, self.BARS[kind])
+
+    def _lines(self, text, kind):
+        """Rendered lines of text, without blank lines at either end
+        (rich pads lists and code blocks; blocks get one separator line instead)."""
+        lines = self.console.render_lines(self._render(text, kind), pad=False)
+
+        def blank(line):
+            return "".join(seg.text for seg in line).strip() in ("", "│")
+
+        while lines and blank(lines[-1]):
+            lines.pop()
+        while lines and blank(lines[0]):
+            lines.pop(0)
+        return lines
+
+    def _commit(self, text, kind=None):
+        kind = kind or self.kind
+        lines = self._lines(text, kind) if text.strip() else []
+        if not lines:
+            return
+        if self.blocks:
+            self.console.print(_RichText(self.BARS[kind].rstrip(), style="dim"))
+        self.console.print(_Lines(lines, end=True))
+        self.blocks += 1
+
+    def _paint(self, force=False):
+        now = time.time()
+        if not force and now - self.last_paint < 0.1:
+            return
+        self.last_paint = now
+        if not self.buf.strip():
+            self.live.update(_RichText(""), refresh=True)
+            return
+        lines = self._lines(self.buf, self.kind)   # ends on its last line, as Live needs
+        keep = max(3, self.console.size.height - 4)
+        self.live.update(_Lines(lines[-keep:]), refresh=True)
+
+    @staticmethod
+    def _last_boundary(text):
+        """Index just past the last finished Markdown block in text, or 0.
+        A block ends at a blank line outside a code fence, or at a closing fence."""
+        cut = pos = 0
+        fence = None
+        for line in text.split("\n")[:-1]:   # the last piece is an unfinished line
+            pos += len(line) + 1
+            s = line.strip()
+            if fence:
+                if s and set(s) == {fence[0]} and len(s) >= len(fence):
+                    fence, cut = None, pos
+            elif _FENCE_RE.match(s):
+                fence = _FENCE_RE.match(s).group(1)
+            elif not s:
+                cut = pos
+        return cut
+
+
 # --- waiting animation (tiny Conway's Game of Life) -------------------------
 # A spinner is boring. A 1-row toroidal Game of Life is the same shape on screen
 # (one line of cells) but actually does something — patterns glide, blinkers
@@ -3206,7 +3401,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     # with broken Enter and garbled typing.
     _INTERRUPT_RESTORED.clear()
     _INTERRUPT_ARMED.set()
-    content, tcs, mode = [], {}, None
+    content, tcs = [], {}
+    out = _StreamView()
     reasoning_parts = []  # captured reasoning_content chunks (for stall feedback)
     timings = None
     usage = None
@@ -3295,9 +3491,6 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                   (d.model_extra or {}).get("reasoning_content") or
                   (d.model_extra or {}).get("reasoning"))
             if rc:
-                if mode != "think":
-                    print(f"{DIM}  ── reasoning ──{RESET}")
-                    mode = "think"
                 # Sanitize leaked special tokens so they never enter history.
                 if _LEAKED_SPECIAL_TOKEN_RE.search(rc):
                     rc = _strip_leaked_tokens(rc)
@@ -3305,7 +3498,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 else:
                     leaked_token_run = 0
                 if rc:
-                    print(f"{DIM}{rc}{RESET}", end="", flush=True)
+                    out.think(rc)
                     reasoning_parts.append(rc)
                 if not content and not tcs:
                     reasoning_only_chars += len(rc)
@@ -3314,7 +3507,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 # Cut the stream if the model has collapsed into special-token
                 # spam (detected via consecutive leaked-token chunks).
                 if LEAKED_TOKEN_RUN_LIMIT > 0 and leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT:
-                    print()
+                    out.end()
                     print(f"{RED}  ⚠ LEAKED-TOKEN COLLAPSE — {leaked_token_run} consecutive "
                           f"special-token chunks; cutting stream now{RESET}")
                     loop_cut = True
@@ -3329,7 +3522,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 # REASONING_ONLY_CHAR_LIMIT chars without any content/tool call).
                 if (REASONING_ONLY_CHAR_LIMIT > 0 and not content and not tcs
                         and reasoning_only_chars >= REASONING_ONLY_CHAR_LIMIT):
-                    print()
+                    out.end()
                     print(f"{RED}  ⚠ REASONING-ONLY LIMIT HIT — "
                           f"{_abbr(reasoning_only_chars)} reasoning chars with no "
                           f"answer/tool call — cutting stream now{RESET}")
@@ -3347,7 +3540,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                         and reasoning_only_start is not None
                         and time.time() - reasoning_only_start >= REASONING_ONLY_TIME_LIMIT):
                     elapsed_reason = time.time() - reasoning_only_start
-                    print()
+                    out.end()
                     print(f"{RED}  ⚠ REASONING-ONLY TIME LIMIT — "
                           f"{elapsed_reason:.0f}s of reasoning with no "
                           f"answer/tool call — cutting stream now{RESET}")
@@ -3358,13 +3551,6 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                     break
             if d.content:
                 clear_tool_status()
-                if mode == "think":
-                    # close out the reasoning block; newline guarantees the green
-                    # answer starts on a fresh line below the dim text
-                    print()  # end the current reasoning line
-                    print(f"{DIM}  ──────────────{RESET}")
-                print(f"{GREEN}", end="")
-                mode = "say"
                 # Sanitize leaked special tokens before display + history.
                 chunk = d.content
                 if _LEAKED_SPECIAL_TOKEN_RE.search(chunk):
@@ -3383,7 +3569,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 else:
                     repeat_chunk_run = 0
                 if chunk:
-                    print(chunk, end="", flush=True)
+                    out.say(chunk)
                     content.append(chunk)
                     streamed_chars += len(chunk)
                 # Cut the stream on a special-token collapse or repetition loop.
@@ -3391,7 +3577,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                         or (REPEAT_CHUNK_LIMIT > 0 and repeat_chunk_run >= REPEAT_CHUNK_LIMIT)):
                     kind = ("special-token collapse" if leaked_token_run >= LEAKED_TOKEN_RUN_LIMIT
                             else "repetition collapse")
-                    print(RESET)
+                    out.end()
                     print(f"{RED}  ⚠ {kind.upper()} — cutting stream now; "
                           f"discarding degenerated output{RESET}")
                     loop_cut = True
@@ -3405,13 +3591,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             for tc in (d.tool_calls or []):
                 # if we were mid-reasoning when tools kicked in, close it out so
                 # the cyan tool box (which starts with its own \n) gets a clean line
-                if mode == "think":
-                    print()
-                    print(f"{DIM}  ──────────────{RESET}")
-                    mode = None
-                elif mode == "say":
-                    print(RESET)
-                    mode = None
+                out.end()
                 s = tcs.setdefault(tc.index, {"id": "", "name": "", "args": ""})
                 if tc.id:
                     s["id"] = tc.id
@@ -3431,6 +3611,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 pass
     finally:
         spinner.stop()
+        out.end()
         clear_tool_status()
         # Disarm the watcher: it stops reading stdin, restores termios in its
         # own inner finally, and parks on _INTERRUPT_ARMED until next turn.
@@ -3446,10 +3627,6 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         _INTERRUPT_RESTORED.wait(timeout=0.5)
         _USER_INTERRUPTED.clear()
     if stream_error is not None:
-        if mode in ("think", "say"):
-            print()
-        if mode == "think":
-            print(f"{DIM}  ──────────────{RESET}")
         print(RESET)
         if isinstance(stream_error, httpx.TimeoutException):
             print(f"{YELLOW}  ✂ STREAM TIMEOUT — server stopped delivering chunks; "
@@ -3472,9 +3649,6 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         return TURN_STREAM_CUT
     # reasoning-only turn (no content, no tool_calls) — close out the block so
     # the stats footer doesn't run straight into the dim reasoning text
-    if mode == "think":
-        print()
-        print(f"{DIM}  ──────────────{RESET}")
     print(RESET)
     text = "".join(content)
     # Final defense-in-depth sanitization: strip any leaked special tokens

@@ -15,6 +15,10 @@ setup(
         "openai",                   # the only runtime dep, per the file's docstring
         "httpx<0.28",               # openai<1.55 passes proxies=; httpx>=0.28 removed it
     ],
+    extras_require={
+        # optional: Markdown rendering of streamed output (plain text without it)
+        "pretty": ["rich"],
+    },
     entry_points={
         "console_scripts": [
             "minion=minion:main",   # creates a `minion` command that calls minion.main()
