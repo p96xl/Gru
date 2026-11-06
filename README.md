@@ -256,6 +256,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_RECOVERY_DRY_MULTIPLIER` / `MINION_RECOVERY_DRY_BASE` / `MINION_RECOVERY_DRY_ALLOWED_LENGTH` | DRY (Don't Repeat Yourself) anti-repetition params for recovery retries (defaults `0.8` / `1.75` / `2`; set `MINION_RECOVERY_DRY_MULTIPLIER` to `0` to disable DRY) |
 | `MINION_FORCED_FINAL_MAX_TOKENS` | token cap for the forced-final-answer rescue request (default 2048) |
 | `MINION_MAX_TOKENS` | token cap for normal streaming requests (default 16000; `0` omits the cap) |
+| `MINION_LIVE_INPUT` | `0` turns off the nudge box shown while the agent works (default on in a terminal) |
 | `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
 | `MINION_RISK_RETRY_SECONDS` | seconds to wait between command-risk classifier connection retries (default 1) |
 | `MINION_SESSION_DESC_REFRESH` | refresh the model-generated session description every N turns (default 6; `0` disables) |
@@ -303,6 +304,28 @@ The prompt is a multi-line editor with a framed box:
 - Long lines word-wrap inside the box
 
 Falls back to plain `input()` when stdin/stdout isn't a TTY.
+
+## Steering while it works
+
+While the agent is working, a nudge box is pinned to the bottom of the
+terminal (output scrolls above it). Type there at any time and press **Enter**
+to queue a message; it's handed to the model at the next step, usually right
+after the current tool call returns, and shown in the transcript as
+`↳ nudge: …`. If the model finishes while a nudge is queued, it keeps going
+and answers it. A request that's already generating can't be changed, so for
+"stop, do this instead" press **Esc**; it also works while a tool runs (a
+waiting `run_bash` stops being waited on and keeps running in the background).
+
+- **Backspace**, **Ctrl+U** (clear), **Ctrl+W** (delete word); a paste
+  becomes a single nudge
+- **Ctrl+C** clears the box; with the box empty it quits as before
+- Anything still unsent when the run ends (or is interrupted) pre-fills the
+  chat input
+- At an approval prompt the box waits until you pause typing, then drops any
+  stray keys, so a half-typed nudge can't answer `Y/n`
+
+Not shown when stdin/stdout isn't a TTY, in `--prompt-file` mode, in
+terminals under 10 rows, or with `MINION_LIVE_INPUT=0`.
 
 ## Interrupting the model
 
