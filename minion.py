@@ -53,6 +53,7 @@ import re
 import secrets
 import select
 import shlex
+import signal
 import unicodedata
 import shutil
 import subprocess
@@ -1400,6 +1401,8 @@ def _interrupt_watcher():
         try:
             while _INTERRUPT_ARMED.is_set() and not _INTERRUPT_EXIT.is_set():
                 r, _, _ = select.select([fd], [], [], 0.1)
+                if _LIVE.active and _LIVE.resized:
+                    _LIVE.relayout()
                 if not r:
                     continue
                 try:
@@ -1408,16 +1411,16 @@ def _interrupt_watcher():
                     _INTERRUPT_RESTORED.set()  # dying — unblock main's wait
                     return
                 if c != b"\x1b":
-                    continue  # discard anything that isn't Esc
+                    if _LIVE.active:
+                        _LIVE.feed(c)  # typed into the live nudge box
+                    continue  # otherwise discard anything that isn't Esc
                 # Could be bare Esc OR the lead byte of an escape sequence
                 # (arrow keys, Home/End, bracketed paste, etc.). Wait up to 50ms
                 # for more bytes; if none arrive, it's a bare Esc.
-                r2, _, _ = select.select([fd], [], [], 0.05)
-                if r2:
-                    try:
-                        os.read(fd, 1)  # swallow the rest of the sequence
-                    except OSError:
-                        pass
+                seq = _read_esc_seq(fd)
+                if seq:
+                    if _LIVE.active:
+                        _LIVE.escape_seq(seq)  # bracketed-paste start/end
                     continue
                 now = time.time()
                 if now - last_fire < 0.25:  # debounce — don't fire twice in a row
@@ -1454,6 +1457,335 @@ def _ensure_interrupt_watcher():
     _INTERRUPT_THREAD = threading.Thread(
         target=_interrupt_watcher, daemon=True, name="minion-interrupt")
     _INTERRUPT_THREAD.start()
+
+
+def _read_esc_seq(fd):
+    """Called right after an ESC byte. Returns the rest of the escape sequence
+    (arrow keys, Home/End, bracketed-paste markers, Alt+key), or b"" when no
+    byte follows within 50 ms, i.e. a bare Esc. Reads a whole CSI/SS3 sequence
+    so its tail bytes ("A" of an Up arrow) aren't mistaken for typed text."""
+    def more():
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if not r:
+            return b""
+        try:
+            return os.read(fd, 1)
+        except OSError:
+            return b""
+    b1 = more()
+    if b1 not in (b"[", b"O"):
+        return b1
+    seq = b1
+    while True:
+        b = more()
+        if not b:
+            return seq
+        seq += b
+        if 0x40 <= b[0] <= 0x7E:  # CSI/SS3 final byte
+            return seq
+
+
+# --- live nudge box -----------------------------------------------------------
+# While the agent works (model streaming AND tools running), a two-line box is
+# pinned to the bottom of the terminal: a separator and a "› " input line. The
+# rest of the screen is a scroll region, so model output scrolls above the box.
+# Keystrokes are read by the interrupt watcher (still the only stdin reader) and
+# fed in here. Enter queues the text; _run_model_turn_loop delivers queued
+# nudges to the model at the next step boundary (a request can't be changed
+# while the server is generating it). Esc still interrupts. Whatever is unsent
+# when the run ends pre-fills the chat input.
+#
+# All stdout writes go through _LockedStdout while the box is up, so a redraw
+# from the watcher thread can never land in the middle of an escape sequence
+# written by the main thread / spinner. Redraws save and restore the cursor
+# (DECSC/DECRC), so the main thread's output position is untouched.
+#
+# Disable with MINION_LIVE_INPUT=0. Never active without a TTY or in one-shot
+# (--prompt-file) mode.
+
+def _cells(s):
+    """Terminal cell width of *s* (wide East-Asian chars and emoji take 2)."""
+    return sum(0 if unicodedata.combining(ch) else
+               2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in s)
+
+
+def _tail_cells(s, width):
+    """The longest suffix of *s* that fits in *width* cells, '…'-prefixed if cut."""
+    if _cells(s) <= width:
+        return s
+    out, used = [], 1
+    for ch in reversed(s):
+        w = _cells(ch)
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return "…" + "".join(reversed(out))
+
+
+class _LockedStdout:
+    """sys.stdout stand-in that serializes write()/flush() with the box redraws."""
+
+    def __init__(self, real, lock):
+        self._real, self._lock = real, lock
+
+    def write(self, data):
+        with self._lock:
+            return self._real.write(data)
+
+    def flush(self):
+        with self._lock:
+            return self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _LiveInput:
+    MIN_ROWS = 10  # smaller terminals: no box (it would eat too much space)
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.active = False
+        self.resized = False
+        self.esc_ended = False  # set by model_turn when Esc cut a stream
+        self.buf = ""
+        self.queue = []
+        self.paste = False
+        self.leftover = ""
+        self.rows = self.cols = 0
+        self.last_key = 0.0
+        self._real = None
+        self._old_winch = None
+        self._old_lines = None
+        self._dec = None
+
+    def _term_size(self):
+        """(cols, rows) of the real terminal. Not shutil.get_terminal_size():
+        that honours $LINES, which this box sets while it's up."""
+        try:
+            return os.get_terminal_size(sys.__stdout__.fileno())
+        except (AttributeError, ValueError, OSError):
+            return shutil.get_terminal_size()
+
+    def _set_lines(self, rows):
+        # Output that sizes itself from $LINES (rich, curses-style tools run by
+        # run_bash) then fits in the scroll region above the box.
+        os.environ["LINES"] = str(max(1, rows - 2))
+
+    @staticmethod
+    def wanted():
+        if os.environ.get("MINION_LIVE_INPUT", "1").strip().lower() in ("0", "off", "false", "no"):
+            return False
+        if _PROMPT_FILE is not None:
+            return False
+        try:
+            return sys.stdin.isatty() and sys.stdout.isatty()
+        except (AttributeError, ValueError):
+            return False
+
+    def start(self):
+        """Pin the box (main thread only). Returns False if it can't/shouldn't."""
+        if self.active or not self.wanted():
+            return False
+        cols, rows = self._term_size()
+        if rows < self.MIN_ROWS:
+            return False
+        self._old_lines = os.environ.get("LINES")
+        self._set_lines(rows)
+        import codecs
+        self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+        self.rows, self.cols = rows, cols
+        self.buf, self.queue, self.paste = "", [], False
+        self.leftover, self.esc_ended, self.resized = "", False, False
+        real = sys.stdout
+        # Two newlines then back up two: if the cursor sits on the bottom rows,
+        # the screen scrolls so it ends up inside the scroll region. DECSTBM
+        # homes the cursor, hence the save/restore around it. 2004h: bracketed
+        # paste, so a pasted multi-line text becomes one nudge.
+        real.write("\n\n\x1b[2A\x1b7" + f"\x1b[1;{rows - 2}r" + "\x1b8\x1b[?2004h")
+        real.flush()
+        self._real = real
+        sys.stdout = _LockedStdout(real, self.lock)
+        try:
+            self._old_winch = signal.signal(signal.SIGWINCH, self._on_winch)
+        except (ValueError, OSError):
+            self._old_winch = None
+        self.active = True
+        self.draw()
+        return True
+
+    def stop(self):
+        if not self.active:
+            return
+        with self.lock:
+            self.active = False
+            r = self.rows
+            self._real.write("\x1b7" + f"\x1b[{r - 1};1H\x1b[2K\x1b[{r};1H\x1b[2K"
+                             + "\x1b[r\x1b8\x1b[?2004l")
+            self._real.flush()
+            sys.stdout = self._real
+            parts = list(self.queue)
+            if self.buf.strip():
+                parts.append(self.buf.strip())
+            self.leftover = "\n".join(parts)
+            self.buf, self.queue = "", []
+            if self._old_lines is None:
+                os.environ.pop("LINES", None)
+            else:
+                os.environ["LINES"] = self._old_lines
+        if self._old_winch is not None:
+            try:
+                signal.signal(signal.SIGWINCH, self._old_winch)
+            except (ValueError, OSError):
+                pass
+            self._old_winch = None
+
+    def take_leftover(self):
+        s, self.leftover = self.leftover, ""
+        return s
+
+    def _on_winch(self, *_):
+        self.resized = True  # handled by the watcher thread (no locks in a signal handler)
+
+    def relayout(self):
+        with self.lock:
+            self.resized = False
+            if not self.active:
+                return
+            cols, rows = self._term_size()
+            if (rows, cols) == (self.rows, self.cols) or rows < 4:
+                return
+            self.rows, self.cols = rows, cols
+            self._set_lines(rows)
+            self._real.write("\x1b7" + f"\x1b[1;{rows - 2}r" + "\x1b8")
+        self.draw()
+
+    def pending(self):
+        with self.lock:
+            return bool(self.queue)
+
+    def drain(self):
+        with self.lock:
+            items, self.queue = self.queue, []
+        self.draw()
+        return items
+
+    def feed(self, data):
+        """Raw bytes typed by the user (from the watcher thread)."""
+        self.last_key = time.time()
+        for ch in self._dec.decode(data):
+            self._key(ch)
+        self.draw()
+
+    def escape_seq(self, seq):
+        if seq == b"[200~":
+            self.paste = True
+        elif seq == b"[201~":
+            self.paste = False
+
+    def _key(self, ch):
+        with self.lock:
+            if ch in "\r\n":
+                if self.paste:
+                    self.buf += " "
+                elif self.buf.strip():
+                    self.queue.append(self.buf.strip())
+                    self.buf = ""
+            elif ch in "\x7f\x08":
+                self.buf = self.buf[:-1]
+            elif ch == "\x15":                      # Ctrl+U: clear the line
+                self.buf = ""
+            elif ch == "\x17":                      # Ctrl+W: delete a word
+                b = self.buf.rstrip()
+                self.buf = b[:len(b) - len(re.search(r"\S*$", b).group())]
+            elif ch == "\x03":                      # Ctrl+C: clear draft, else quit as usual
+                if self.buf:
+                    self.buf = ""
+                else:
+                    os.kill(os.getpid(), signal.SIGINT)
+            elif ch == "\t" or ch >= " ":
+                self.buf += " " if ch == "\t" else ch
+
+    def draw(self):
+        if not self.active:
+            return
+        with self.lock:
+            if not self.active:
+                return
+            rows, width = self.rows, max(10, self.cols - 1)
+            label = " nudge · Enter sends it at the next step · Esc interrupts "
+            if self.queue:
+                label += f"· {len(self.queue)} queued "
+            sep = ("──" + label + "─" * width)[:width]
+            if self.buf:
+                text, style = _tail_cells(self.buf, width - 3), ""
+            elif self.queue:
+                text, style = _tail_cells("queued: " + self.queue[-1], width - 3), DIM
+            else:
+                text, style = "type here to steer the model while it works", DIM
+            self._real.write(
+                "\x1b7" + f"\x1b[{rows - 1};1H\x1b[2K" + DIM + sep + RESET
+                + f"\x1b[{rows};1H\x1b[2K" + CYAN + "› " + RESET + style + text + RESET
+                + "\x1b8")
+            self._real.flush()
+
+
+_LIVE = _LiveInput()
+
+
+class _live_paused:
+    """Context manager: hand stdin back for an approval prompt during a live run.
+    Disarms the watcher (waiting until it restored termios) and drops any
+    typed-ahead bytes, so half a nudge can't answer a Y/n prompt (where almost
+    any key means yes). If the user is mid-sentence, the box keeps taking keys
+    until they pause for QUIET seconds (at most MAX_WAIT) before handing over."""
+    QUIET, MAX_WAIT = 0.5, 5.0
+
+    def __enter__(self):
+        self.on = _LIVE.active and _INTERRUPT_ARMED.is_set()
+        if self.on:
+            end = time.time() + self.MAX_WAIT
+            while time.time() - _LIVE.last_key < self.QUIET and time.time() < end:
+                time.sleep(0.05)
+            _INTERRUPT_ARMED.clear()
+            _INTERRUPT_RESTORED.wait(timeout=0.5)
+            try:
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except (termios.error, OSError, ValueError):
+                pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.on:
+            _INTERRUPT_RESTORED.clear()
+            _INTERRUPT_ARMED.set()
+        return False
+
+
+def _append_user_note(messages, note):
+    """Add *note* as user content without creating two user turns in a row."""
+    last = messages[-1] if messages else None
+    if last and last.get("role") == "user" and isinstance(last.get("content"), str):
+        last["content"] = f"{last['content']}\n\n{note}"
+    else:
+        messages.append({"role": "user", "content": note})
+
+
+def _deliver_nudges(messages):
+    """Move queued nudges from the box into the conversation. Returns True if any."""
+    items = _LIVE.drain()
+    if not items:
+        return False
+    text = "\n".join(items)
+    for line in items:
+        print(f"{MAGENTA}  ↳ nudge: {line}{RESET}")
+    _log_event("nudge", text)
+    _append_user_note(messages,
+        "[Message from the user, typed while you were working. Take it into "
+        "account and adjust course; keep going unless it asks you to stop.]\n" + text)
+    return True
 
 
 # --- tools ------------------------------------------------------------------
@@ -2507,6 +2839,11 @@ _ACTIVE_SPINNER = None  # set by run_tool() while a tool body is executing
 
 
 def _ask_approval(prompt):
+    with _live_paused():
+        return _ask_approval_key(prompt)
+
+
+def _ask_approval_key(prompt):
     """Read a single keypress for a Y/n/esc approval prompt. Returns one of
     'y', 'n', 'esc'. Esc is accepted both as the bare Esc key (read in raw
     mode) and as the letter 'e'/'E' for terminals where raw mode isn't
@@ -3442,8 +3779,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         # completes in <0.1s; the 0.5s timeout is a safety net for the rare
         # case where the turn was too short for the watcher to even arm (in
         # which case termios was never changed and there's nothing to restore).
-        _INTERRUPT_ARMED.clear()
-        _INTERRUPT_RESTORED.wait(timeout=0.5)
+        # A live-nudge run (_run_model_turn_loop) keeps the watcher armed
+        # across all steps, tools included, and disarms it itself at the end.
+        # (Arming above is then a no-op: it already is.)
+        if not _LIVE.active:
+            _INTERRUPT_ARMED.clear()
+            _INTERRUPT_RESTORED.wait(timeout=0.5)
         _USER_INTERRUPTED.clear()
     if stream_error is not None:
         if mode in ("think", "say"):
@@ -3493,6 +3834,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         messages.append({"role": "user", "content":
             "[User interrupted your previous response with Esc. "
             "Acknowledge briefly and wait for their next message.]"})
+        _LIVE.esc_ended = True  # don't let a queued nudge restart the loop
         return TURN_DONE
 
     if not loop_cut and not text.strip() and not tcs and reasoning_only_chars > 0:
@@ -3815,11 +4157,35 @@ MAX_MODEL_TURNS = _env_int("MINION_MAX_MODEL_TURNS", 200)
 
 def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
                          on_step=None):
+    """Run the agent until it's done. In a terminal, pin the live nudge box for
+    the duration and keep the Esc/typing watcher armed the whole time."""
+    if not _LIVE.start():
+        return _run_model_turn_steps(messages, force_final, recovery_sampling, on_step)
+    _ensure_interrupt_watcher()
+    _USER_INTERRUPTED.clear()
+    _INTERRUPT_RESTORED.clear()
+    _INTERRUPT_ARMED.set()
+    try:
+        return _run_model_turn_steps(messages, force_final, recovery_sampling, on_step)
+    finally:
+        # Disarm first (and wait for the watcher to restore termios) so it
+        # can't redraw the box after it's gone or leave the tty in raw mode.
+        _INTERRUPT_ARMED.clear()
+        _INTERRUPT_RESTORED.wait(timeout=0.5)
+        _USER_INTERRUPTED.clear()
+        _LIVE.stop()
+
+
+def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
+                          on_step=None):
     steps = 0
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
     empty_turn_cuts = 0
     while steps < MAX_MODEL_TURNS:  # cap runaway tool/retry loops
+        if _LIVE.active:
+            _deliver_nudges(messages)
+            _LIVE.esc_ended = False
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
                             empty_turn_count=empty_turn_cuts,
                             forced_final=force_final,
@@ -3828,7 +4194,19 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
             on_step()
         force_final = False
         recovery_sampling = False
+        if (_LIVE.active and status != TURN_ESC and not _LIVE.esc_ended
+                and _USER_INTERRUPTED.is_set()):
+            # Esc pressed while a tool ran (the stream itself wasn't cut).
+            _USER_INTERRUPTED.clear()
+            print(f"{YELLOW}  ↳ interrupted by user (Esc){RESET}")
+            _append_user_note(messages,
+                "[User pressed Esc while your tool call ran and returned to chat. "
+                "Acknowledge briefly and wait for their next message.]")
+            break
         if status == TURN_DONE:
+            if _LIVE.active and not _LIVE.esc_ended and _LIVE.pending():
+                steps += 1  # a nudge arrived as the model finished: keep going
+                continue
             break
         if status == TURN_ESC:
             break  # user pressed Esc at an approval → drop to chat input
@@ -4421,7 +4799,10 @@ def main():
 
     while True:
         try:
-            user = read_multiline(history=history)
+            # Unsent text from the live nudge box pre-fills the chat input.
+            draft = _LIVE.take_leftover()
+            user = (read_multiline(initial=draft, history=history) if draft
+                    else read_multiline(history=history))
         except (EOFError, KeyboardInterrupt):
             print()
             # Flush the current session on Ctrl-D / Ctrl-C exit so the last

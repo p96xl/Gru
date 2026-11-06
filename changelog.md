@@ -2,6 +2,21 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — live nudge box: steer the agent while it works
+
+While the agent runs, a two-line input box is pinned to the bottom of the
+terminal (a scroll region keeps output above it). Text typed there and sent
+with Enter is queued and added to the conversation at the next step boundary;
+if the model finishes with a nudge queued, the loop continues so it can answer.
+Esc still interrupts, and unsent text pre-fills the chat input afterwards.
+The Esc watcher thread stays the only stdin reader: it now stays armed for the
+whole run (tools included) and feeds keystrokes to the box, consuming whole
+escape sequences so arrow-key tails aren't typed. Because it's armed while
+tools run, Esc during `run_bash` now works as well. Approval prompts pause it,
+wait for a typing pause and flush stray input first. While the box is up,
+`LINES` is set to the rows above it so curses/rich-style output fits. Off
+without a TTY, in `--prompt-file` mode, or with `MINION_LIVE_INPUT=0`.
+
 ### Added — OpenRouter built-in source with provider routing
 
 New built-in `openrouter` source auto-registers when `OPENROUTER_API_KEY` is
