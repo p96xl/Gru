@@ -2,6 +2,15 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — whitespace-only stream chunks were dropped
+
+Streamed reasoning and answer chunks were only printed and kept when
+`chunk.strip()` was non-empty, so chunks that are only whitespace were lost.
+Models whose tokenizers emit newlines and the space before a digit as separate
+tokens (Qwen) lost every line break and those spaces ("an 800x500" became
+"an800x500"), on screen, in the captured reasoning fed back after a stall, and
+in the answer text kept in history.
+
 ### Added — OpenRouter built-in source with provider routing
 
 New built-in `openrouter` source auto-registers when `OPENROUTER_API_KEY` is
