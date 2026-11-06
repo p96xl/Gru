@@ -1857,19 +1857,37 @@ def _poll_pid(pid, timeout, check_esc=False):
         pid_i = int(pid)
     except (TypeError, ValueError):
         return "exited"  # no valid pid → the command never started
-    while time.time() < deadline:
-        try:
-            os.kill(pid_i, 0)
-        except ProcessLookupError:
-            return "exited"
-        except PermissionError:
-            pass  # process exists but owned by another uid — still alive
-        except OSError:
-            return "exited"  # unexpected (e.g. EINTR); bail to be safe
-        if check_esc and _USER_INTERRUPTED.is_set():
-            return "interrupted"
-        time.sleep(0.1)
-    return "timeout"
+    # The Esc watcher only reads stdin while armed, and model_turn disarms it
+    # when the stream ends, so without this Esc during a command was never
+    # seen. Arm it for the wait (approval prompts are over by now). If
+    # something else already armed it, leave arming to that owner.
+    own_arm = (check_esc and not _INTERRUPT_ARMED.is_set()
+               and sys.stdin.isatty() and sys.stdout.isatty())
+    if own_arm:
+        _ensure_interrupt_watcher()
+        _USER_INTERRUPTED.clear()
+        _INTERRUPT_RESTORED.clear()
+        _INTERRUPT_ARMED.set()
+    try:
+        while time.time() < deadline:
+            try:
+                os.kill(pid_i, 0)
+            except ProcessLookupError:
+                return "exited"
+            except PermissionError:
+                pass  # process exists but owned by another uid — still alive
+            except OSError:
+                return "exited"  # unexpected (e.g. EINTR); bail to be safe
+            if check_esc and _USER_INTERRUPTED.is_set():
+                return "interrupted"
+            time.sleep(0.1)
+        return "timeout"
+    finally:
+        if own_arm:
+            # Same handshake as model_turn: wait until the watcher restored
+            # cooked termios before anything else (e.g. the chatbox) reads stdin.
+            _INTERRUPT_ARMED.clear()
+            _INTERRUPT_RESTORED.wait(timeout=0.5)
 
 
 def _read_log(log_path):

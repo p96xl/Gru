@@ -2,6 +2,15 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — Esc did nothing while `run_bash` waited on a command
+
+`run_bash` and `wait_background` poll for Esc so you can stop waiting on a slow
+command (it then keeps running in the background), but the Esc watcher only
+reads stdin while armed, and `model_turn` disarms it when the stream ends, so
+that check could never fire: minion sat through the whole poll window. The
+poll now arms the watcher for its duration (when stdin/stdout are a terminal
+and nothing else has armed it) and disarms it with the same termios handshake
+`model_turn` uses.
 ### Added — Markdown rendering of streamed output (optional, `rich`)
 
 With the optional `pretty` extra installed (`pip install -e '.[pretty]'`),
