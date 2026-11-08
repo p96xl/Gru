@@ -3001,6 +3001,39 @@ def compress(messages, keep=COMPRESS_KEEP, auto=False):
     return len(tail), summarized_n, len(summary)
 
 
+def _context_tokens(usage, timings):
+    """Tokens the model actually had in context for this turn. llama.cpp's
+    `timings.prompt_n` counts only the prompt tokens it had to process, not the
+    ones reused from its cache (`cache_n`), so on a warm cache it reports a few
+    hundred tokens for a 130K-token context. Prefer `usage.prompt_tokens`."""
+    if usage is not None and getattr(usage, "prompt_tokens", None):
+        return usage.prompt_tokens
+    timings = timings or {}
+    return (timings.get("prompt_n") or 0) + (timings.get("cache_n") or 0)
+
+
+def _estimate_context(prompt_tokens, new_messages):
+    """Context size for the next request: the last request's prompt plus a
+    chars/3.5 estimate of what was appended since (the reply, tool results)."""
+    chars = 0
+    for msg in new_messages:
+        chars += len(str(msg.get("content") or ""))
+        for tc in msg.get("tool_calls") or []:
+            chars += len(str((tc.get("function") or {}).get("arguments") or ""))
+    return int(prompt_tokens or 0) + int(chars / 3.5)
+
+
+def _over_autocompress_threshold(prompt_tokens):
+    if AUTOCOMPRESS_PERCENT <= 0 or ACTIVE is None:
+        return False
+    if not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
+        return False
+    mx = ACTIVE._context_window
+    if not isinstance(mx, int) or mx <= 0:
+        return False
+    return prompt_tokens * 100 / mx >= AUTOCOMPRESS_PERCENT
+
+
 def _maybe_autocompress(messages, prompt_tokens):
     """Silently compress when context usage crosses the AUTOCOMPRESS_PERCENT
     threshold. Called after each settled model turn with the last turn's
@@ -3014,16 +3047,10 @@ def _maybe_autocompress(messages, prompt_tokens):
     """
     if AUTOCOMPRESS_PERCENT <= 0:
         return False
-    if not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
-        return False
-    if ACTIVE is None:
+    if not _over_autocompress_threshold(prompt_tokens):
         return False
     mx = ACTIVE._context_window
-    if not isinstance(mx, int) or mx <= 0:
-        return False
     ratio = prompt_tokens / mx
-    if ratio * 100 < AUTOCOMPRESS_PERCENT:
-        return False
     result = compress(messages, auto=True)
     if result is None:
         return False
@@ -3627,7 +3654,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     if _METRICS is not None:
         _METRICS.add(_normalize_usage(usage, timings, fallback_chars=streamed_chars))
     if timings and timings.get("predicted_n"):
-        prompt_n = timings.get("prompt_n", 0)
+        prompt_n = _context_tokens(usage, timings)
         if prompt_n:
             _LAST_PROMPT_TOKENS = prompt_n
         gen_n = timings["predicted_n"]
@@ -3815,11 +3842,14 @@ MAX_MODEL_TURNS = _env_int("MINION_MAX_MODEL_TURNS", 200)
 
 def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
                          on_step=None):
+    global _LAST_PROMPT_TOKENS
     steps = 0
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
     empty_turn_cuts = 0
+    compress_failed = False
     while steps < MAX_MODEL_TURNS:  # cap runaway tool/retry loops
+        n_before = len(messages)
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
                             empty_turn_count=empty_turn_cuts,
                             forced_final=force_final,
@@ -3869,6 +3899,16 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False,
             # entire timeout.  Keep the counter so cumulative stalls escalate.
             malformed_stream_cuts = 0
             empty_turn_cuts = 0
+            # A long autonomous run never returns to the REPL, where auto-
+            # compress normally runs, so check between steps too. One failed
+            # attempt is enough per run: each try is a full summary call.
+            if not compress_failed and _LAST_PROMPT_TOKENS:
+                est = _estimate_context(_LAST_PROMPT_TOKENS, messages[n_before:])
+                if _over_autocompress_threshold(est):
+                    if _maybe_autocompress(messages, est):
+                        _LAST_PROMPT_TOKENS = 0  # stale until the next reply
+                    else:
+                        compress_failed = True
             continue
     # Loop exited because steps >= MAX_MODEL_TURNS.  In interactive mode the
     # user can simply type another instruction; in headless mode (benchmarks)

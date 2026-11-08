@@ -122,7 +122,8 @@ The current half is colorized by how full the window is (green < 30%, yellow
 30–60%, red 60%+), so a glance tells you whether you're nearing the limit. When
 the conversation fills `MINION_AUTOCOMPRESS_PERCENT` (default 85%) of the
 window, older turns are folded into a summary automatically, keeping the last
-~⅓ verbatim — see `/autocompress`. The
+~⅓ verbatim — see `/autocompress`. This is checked between tool steps too, so a
+long unattended run compresses as it goes instead of filling the window. The
 max is probed once per source/model and cached: for **local** servers (llama.cpp)
 it reads `/v1/models`/`/props` (sub-ms LAN round-trips); for **remote** hosts
 (T Together, Z.ai, …) it leads with the over-`max_tokens` chat probe — a
