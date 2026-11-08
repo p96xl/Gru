@@ -2,6 +2,20 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — auto-compress never fired on long llama.cpp runs
+
+Two bugs kept long unattended runs from compressing until the window was full
+and the next request failed:
+
+- The context size came from llama.cpp's `timings.prompt_n`, which counts only
+  the prompt tokens processed for that request, not the ones reused from its
+  cache (`cache_n`). On a warm cache a 130,948-token context read as 333, so
+  the `ctx` footer was wrong and the 85% threshold was never reached. It now
+  uses `usage.prompt_tokens`, or `prompt_n + cache_n`.
+- Auto-compress only ran after the whole task returned to the prompt, which a
+  multi-hour autonomous run never does. It is now checked between tool steps
+  too, using the last prompt size plus an estimate of the new tool output. A
+  failed attempt is not retried for the rest of that run.
 ### Fixed — runs no longer stop after "Let me do X:"
 
 Right after a tool result, models (local quants especially) sometimes write the
