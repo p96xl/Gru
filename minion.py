@@ -2793,6 +2793,11 @@ FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 2048)
 # it back into producing either a tool call or a visible answer. 0 disables the
 # auto-continue (an empty turn then drops to chat as before).
 EMPTY_TURN_RETRY_LIMIT = _env_int("MINION_EMPTY_TURN_RETRIES", 3)
+# A turn that *announces* the next step ("Let me check the header:", "I'll run
+# the tests now.") but ends without the tool call is the same stall with words
+# on it: nothing ran, yet the loop treated it as done and sat at the prompt for
+# hours on unattended runs. Only checked right after a tool result. 0 disables.
+ANNOUNCED_STOP_RETRY_LIMIT = _env_int("MINION_ANNOUNCED_STOP_RETRIES", 2)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
 
 # --- auto context-compression -----------------------------------------------
@@ -2866,6 +2871,30 @@ def _last_is_dangling_tool(messages):
     answer. Auto-continue is most warranted in exactly this case.
     """
     return bool(messages) and messages[-1].get("role") == "tool"
+
+
+_ANNOUNCE_RE = re.compile(
+    r"\b(let me|let's|i'll|i will|i'm going to|i am going to|now i|next,? i)\b", re.I)
+_NOT_ANNOUNCE_RE = re.compile(
+    r"\b(let me know|if you|would you|do you|want me|shall i|should i|"
+    r"i'll wait|i will wait)\b", re.I)
+ANNOUNCED_STOP_NUDGE = (
+    "You described your next step but ended your turn without calling a tool, so "
+    "nothing ran. Make that tool call now and keep going. If the task is actually "
+    "finished, say so in one or two lines; if you need the user, ask a direct question."
+)
+
+
+def _announces_unrun_action(text):
+    """True if the turn's closing words promise an action ("Let me read X:",
+    "I'll run the tests.") rather than finish or ask something."""
+    tail = text.replace("\u2019", "'").strip().rsplit("\n\n", 1)[-1].strip()
+    if not tail or tail.endswith("?") or tail.startswith("```"):
+        return False
+    if tail.endswith(":"):
+        return True
+    last = re.split(r"(?<=[.!])\s+", tail)[-1]
+    return bool(_ANNOUNCE_RE.search(last)) and not _NOT_ANNOUNCE_RE.search(last)
 
 
 # --- risk classifier --------------------------------------------------------
@@ -3626,6 +3655,7 @@ TURN_STREAM_CUT = "stream_cut"
 TURN_FORCE_FINAL = "force_final"
 TURN_STALL = "stall"  # reasoning-only stall → nudge to act (full tools retained)
 TURN_EMPTY = "empty"  # assistant emitted no content and no tool calls → silent stall
+TURN_ANNOUNCED = "announced"  # said "let me do X" after a tool result, then stopped
 TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
 
 
@@ -4333,8 +4363,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
             return TURN_FORCE_FINAL
         return TURN_DONE
+    announced = (not forced_final and _last_is_dangling_tool(messages)
+                 and _announces_unrun_action(text))
     messages.append({"role": "assistant", "content": text})
-    return TURN_DONE
+    # The loop decides whether to nudge (it owns the retry budget); any other
+    # caller can treat TURN_ANNOUNCED exactly like TURN_DONE.
+    return TURN_ANNOUNCED if announced else TURN_DONE
 
 
 # Maximum number of model turns (tool calls + retries) per session before the
@@ -4374,6 +4408,7 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
     empty_turn_cuts = 0
+    announced_stop_cuts = 0
     while steps < MAX_MODEL_TURNS:  # cap runaway tool/retry loops
         if _LIVE.active:
             _deliver_nudges(messages)
@@ -4407,6 +4442,16 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
             malformed_stream_cuts += 1
             recovery_sampling = True
             continue
+        if status == TURN_ANNOUNCED:
+            if announced_stop_cuts >= ANNOUNCED_STOP_RETRY_LIMIT:
+                break  # it keeps stopping there: treat as done
+            announced_stop_cuts += 1
+            print(f"{YELLOW}  ✂ STOPPED AFTER ANNOUNCING A STEP — no tool call was made; "
+                  f"nudging the model to continue "
+                  f"({announced_stop_cuts}/{ANNOUNCED_STOP_RETRY_LIMIT}){RESET}")
+            messages.append({"role": "user",
+                             "content": f"[Runtime note: {ANNOUNCED_STOP_NUDGE}]"})
+            continue
         if status == TURN_EMPTY:
             empty_turn_cuts += 1
             recovery_sampling = True  # more entropy to escape the empty-output attractor
@@ -4439,6 +4484,7 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
             # entire timeout.  Keep the counter so cumulative stalls escalate.
             malformed_stream_cuts = 0
             empty_turn_cuts = 0
+            announced_stop_cuts = 0
             continue
     # Loop exited because steps >= MAX_MODEL_TURNS.  In interactive mode the
     # user can simply type another instruction; in headless mode (benchmarks)
