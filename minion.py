@@ -37,6 +37,7 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
 
 Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /memory save|remember|list  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
+       --features  (list this fork's additions and their on/off switches)
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
        MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
        MINION_BACKEND=vllm  (disables llama.cpp-only recovery knobs like min_p /
@@ -97,6 +98,40 @@ def _load_env_file():
 
 
 _load_env_file()
+
+
+# --- what this fork adds (p96xl/minion) -------------------------------------
+# Every behaviour this fork adds on top of sentdex/minion has a switch here.
+# Set one to 0 (a "MINION_X = 0" line in a model's minion.conf, ~/.env, or the
+# shell) and minion does what upstream does at that point. `minion --features`
+# prints this list with what each is set to now. Two plain bug fixes have no
+# switch, because turning them off only breaks things: whitespace-only stream
+# chunks are kept (upstream drops spaces/newlines), and the context size shown
+# counts llama.cpp's cached prompt tokens (upstream reads only the new ones).
+FEATURES = (
+    # (setting, default, what it does)
+    ("MINION_LIVE_INPUT", "1", "nudge box: type while the agent works, Enter sends it"),
+    ("MINION_MARKDOWN", "1", "show answers as Markdown with rich (when installed)"),
+    ("MINION_ESC_IN_BASH", "1", "Esc stops the agent while run_bash waits on a command"),
+    ("MINION_ESC_WHILE_WAITING", "1", "Esc works while the server is still reading a long prompt"),
+    ("MINION_ANNOUNCED_STOP", "1", "carry on when the model says 'let me X:' then stops without a tool call"),
+    ("MINION_MIDRUN_COMPRESS", "1", "auto-compress between the steps of a long run, not only at the prompt"),
+)
+_FEATURE_DEFAULTS = {name: default for name, default, _ in FEATURES}
+
+
+def _feature(name):
+    """True unless the switch is set to 0 / off / false / no."""
+    val = os.environ.get(name, _FEATURE_DEFAULTS[name]).strip().lower()
+    return val not in ("0", "off", "false", "no")
+
+
+def _print_features():
+    print("Features this fork adds (0 turns one off; set in minion.conf, ~/.env or the shell):")
+    for name, default, what in FEATURES:
+        state = "on " if _feature(name) else "off"
+        src = "" if name not in os.environ else "  (set)"
+        print(f"  {state}  {name:<26} {what}{src}")
 
 
 # --- sessions ---------------------------------------------------------------
@@ -1231,7 +1266,8 @@ SHOW_CURSOR = "\033[?25h"
 # for good, the block still being written shows in a small live area under it.
 # Reasoning sits behind a dim "│" bar and closes with how long it took.
 # Plain text, as before, when rich is missing, stdout isn't a terminal, or
-# MINION_PLAIN=1. MINION_CODE_THEME picks the code colours (a Pygments style).
+# MINION_MARKDOWN=0 (or MINION_PLAIN=1). MINION_CODE_THEME picks the code
+# colours (a Pygments style).
 try:
     from rich.console import Console as _RichConsole
     from rich.live import Live as _RichLive
@@ -1241,7 +1277,7 @@ try:
 except ImportError:
     _RichConsole = None
 
-_PRETTY = (_RichConsole is not None and sys.stdout.isatty()
+_PRETTY = (_RichConsole is not None and sys.stdout.isatty() and _feature("MINION_MARKDOWN")
            and os.environ.get("MINION_PLAIN", "").strip().lower() not in ("1", "true", "yes"))
 _CODE_THEME = os.environ.get("MINION_CODE_THEME", "monokai")
 _FENCE_RE = re.compile(r"(`{3,}|~{3,})")
@@ -1701,7 +1737,8 @@ def _call_interruptibly(fn):
     chunk loop's Esc check never runs. While the Esc watcher is armed in a
     terminal, run the call on a helper thread; on Esc, cut the connection and
     raise _RequestInterrupted."""
-    if not (_INTERRUPT_ARMED.is_set() and sys.stdin.isatty()):
+    if not (_feature("MINION_ESC_WHILE_WAITING")
+            and _INTERRUPT_ARMED.is_set() and sys.stdin.isatty()):
         return fn()
     box, done, abandoned = {}, threading.Event(), threading.Event()
     api_client = client
@@ -1869,7 +1906,7 @@ class _LiveInput:
 
     @staticmethod
     def wanted():
-        if os.environ.get("MINION_LIVE_INPUT", "1").strip().lower() in ("0", "off", "false", "no"):
+        if not _feature("MINION_LIVE_INPUT"):
             return False
         if _PROMPT_FILE is not None:
             return False
@@ -2291,7 +2328,7 @@ def _poll_pid(pid, timeout, check_esc=False):
     # when the stream ends, so without this Esc during a command was never
     # seen. Arm it for the wait (approval prompts are over by now). If
     # something else already armed it, leave arming to that owner.
-    own_arm = (check_esc and not _INTERRUPT_ARMED.is_set()
+    own_arm = (check_esc and _feature("MINION_ESC_IN_BASH") and not _INTERRUPT_ARMED.is_set()
                and sys.stdin.isatty() and sys.stdout.isatty())
     if own_arm:
         _ensure_interrupt_watcher()
@@ -4495,7 +4532,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
             return TURN_FORCE_FINAL
         return TURN_DONE
-    announced = (not forced_final and _last_is_dangling_tool(messages)
+    announced = (not forced_final and _feature("MINION_ANNOUNCED_STOP")
+                 and _last_is_dangling_tool(messages)
                  and _announces_unrun_action(text))
     messages.append({"role": "assistant", "content": text})
     # The loop decides whether to nudge (it owns the retry budget); any other
@@ -4623,7 +4661,8 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
             # A long autonomous run never returns to the REPL, where auto-
             # compress normally runs, so check between steps too. One failed
             # attempt is enough per run: each try is a full summary call.
-            if not compress_failed and _LAST_PROMPT_TOKENS:
+            if (not compress_failed and _LAST_PROMPT_TOKENS
+                    and _feature("MINION_MIDRUN_COMPRESS")):
                 est = _estimate_context(_LAST_PROMPT_TOKENS, messages[n_before:])
                 if _over_autocompress_threshold(est):
                     print(f"{DIM}  ↻ context near full — compressing older steps "
@@ -5045,6 +5084,9 @@ def _run_one_shot():
 
 def main():
     global YOLO, APPROVE_LEVEL, DEFAULT_APPROVE_LEVEL, AUTOCOMPRESS_PERCENT
+    if "--features" in sys.argv[1:]:
+        _print_features()
+        return
     # --prompt-file: headless single-shot mode — run one turn and exit.
     if _run_one_shot():
         return

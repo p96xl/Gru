@@ -8,6 +8,24 @@
 
 ## What this fork adds
 
+Still one file, `minion.py`. Every change below can be turned off with a switch, and off
+means minion does what upstream does there. Put `MINION_X = 0` in a model's `minion.conf`,
+in `~/.env`, or in the shell. `minion --features` shows what's on:
+
+| Switch | What it turns on (default: all on) |
+|---|---|
+| `MINION_LIVE_INPUT` | nudge box: type while the agent works, Enter sends it |
+| `MINION_MARKDOWN` | answers shown as Markdown with rich (when installed) |
+| `MINION_ESC_IN_BASH` | Esc stops the agent while `run_bash` waits on a command |
+| `MINION_ESC_WHILE_WAITING` | Esc works while the server is still reading a long prompt |
+| `MINION_ANNOUNCED_STOP` | carry on when the model says "let me X:" and stops without a tool call |
+| `MINION_MIDRUN_COMPRESS` | auto-compress between the steps of a long run, not only at the prompt |
+
+Two plain bug fixes have no switch, since turning them off only breaks things: whitespace-only
+stream chunks are kept, and the context size counts llama.cpp's cached prompt tokens.
+Each change also lives on its own branch (linked below), so it can be dropped from the code
+entirely by rebuilding `local/all` without that branch.
+
 ### Steer the agent while it works
 
 While minion is working, a nudge box stays pinned to the bottom of the terminal and the
