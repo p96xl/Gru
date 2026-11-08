@@ -55,6 +55,7 @@ import select
 import shlex
 import unicodedata
 import shutil
+import socket
 import subprocess
 import sys
 import termios
@@ -1435,6 +1436,101 @@ def _interrupt_watcher():
             # main waits on this after clearing _INTERRUPT_ARMED so the chatbox
             # never captures our raw-mode termios as its "old" state.
             _INTERRUPT_RESTORED.set()
+
+
+class _RequestInterrupted(BaseException):
+    """Esc was pressed while a request was still waiting for the server.
+    BaseException so the API-error handlers in open_stream don't swallow it."""
+
+
+def _disarm_interrupt_watcher():
+    """Disarm and wait for the watcher to restore termios (see model_turn)."""
+    _INTERRUPT_ARMED.clear()
+    _INTERRUPT_RESTORED.wait(timeout=0.5)
+    _USER_INTERRUPTED.clear()
+
+
+def _shutdown_active_connections(api_client):
+    """Cut the client's in-flight HTTP connections. The blocked read returns at
+    once, and llama.cpp sees the disconnect and stops processing the prompt.
+    Reaches into httpx/httpcore internals, so it is best effort."""
+    try:
+        conns = list(api_client._client._transport._pool.connections)
+    except Exception:
+        return 0
+    cut = 0
+    for conn in conns:
+        try:
+            if conn.is_idle():
+                continue
+            sock = conn._connection._network_stream.get_extra_info("socket")
+            sock.shutdown(socket.SHUT_RDWR)
+            cut += 1
+        except Exception:
+            pass
+    return cut
+
+
+_ABANDONED_REQUEST_THREADS = set()
+
+
+def _refuse_abandoned_request(request):
+    """httpx request hook: the SDK retries a request whose connection dropped,
+    so an abandoned call would quietly re-send the whole prompt. Stop it before
+    any bytes go out (BaseException, so the SDK's retry loop can't catch it)."""
+    if threading.get_ident() in _ABANDONED_REQUEST_THREADS:
+        raise _RequestInterrupted()
+
+
+def _install_abandon_hook(api_client):
+    try:
+        http = api_client._client
+        hooks = http.event_hooks
+        if _refuse_abandoned_request not in hooks.get("request", []):
+            hooks["request"] = list(hooks.get("request", [])) + [_refuse_abandoned_request]
+            http.event_hooks = hooks
+    except Exception:
+        pass
+
+
+def _call_interruptibly(fn):
+    """Run a blocking API call so Esc can abandon it.
+
+    llama.cpp holds back the response headers of a streamed completion until
+    the first token, so on a long prompt `create()` blocks for minutes and the
+    chunk loop's Esc check never runs. While the Esc watcher is armed in a
+    terminal, run the call on a helper thread; on Esc, cut the connection and
+    raise _RequestInterrupted."""
+    if not (_INTERRUPT_ARMED.is_set() and sys.stdin.isatty()):
+        return fn()
+    box, done, abandoned = {}, threading.Event(), threading.Event()
+    api_client = client
+    _install_abandon_hook(api_client)
+
+    def run():
+        try:
+            box["value"] = fn()
+            if abandoned.is_set():  # Esc raced the reply: don't leak the stream
+                close = getattr(box["value"], "close", None)
+                if close:
+                    close()
+        except BaseException as e:
+            box["error"] = e
+        finally:
+            _ABANDONED_REQUEST_THREADS.discard(threading.get_ident())
+            done.set()
+
+    worker = threading.Thread(target=run, daemon=True, name="minion-request")
+    worker.start()
+    while not done.wait(0.05):
+        if _USER_INTERRUPTED.is_set():
+            abandoned.set()
+            _ABANDONED_REQUEST_THREADS.add(worker.ident)  # before the cut: no retry
+            _shutdown_active_connections(api_client)
+            raise _RequestInterrupted()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def _ensure_interrupt_watcher():
@@ -2833,9 +2929,9 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
             request_opts.update(ACTIVE.extra_request_kwargs())
         try:
             _log_event("req", {"model": MODEL, "messages": messages, "tools": tools, "stream": True, **request_opts})
-            stream = client.chat.completions.create(
+            stream = _call_interruptibly(lambda: client.chat.completions.create(
                 model=MODEL, messages=messages, tools=tools, stream=True,
-                stream_options={"include_usage": True}, **request_opts)
+                stream_options={"include_usage": True}, **request_opts))
         except APIConnectionError:
             raise  # server unreachable — don't bother retrying without tools
         except httpx.HTTPError:
@@ -2850,9 +2946,9 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
                 try:
                     _tag = "no-tools" if fallback_keys == {"tool_choice"} else "no-tools-no-extra"
                     _log_event("req", {"model": MODEL, "messages": messages, "stream": True, "_fallback": _tag, **fallback_opts})
-                    stream = client.chat.completions.create(
+                    stream = _call_interruptibly(lambda: client.chat.completions.create(
                         model=MODEL, messages=messages, stream=True,
-                        stream_options={"include_usage": True}, **fallback_opts)
+                        stream_options={"include_usage": True}, **fallback_opts))
                     break  # succeeded
                 except (APIConnectionError, httpx.HTTPError):
                     raise  # transport failure — don't retry further
@@ -3172,29 +3268,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     )
     spinner = LifeSpinner(label=spinner_label)
     spinner.start()
-    try:
-        if forced_final:
-            stream = open_stream(
-                messages,
-                tools=[FINAL_ANSWER_TOOL],
-                tool_choice=FINAL_ANSWER_TOOL_CHOICE,
-                max_tokens=FORCED_FINAL_MAX_TOKENS,
-                recovery_sampling=recovery_sampling,
-            )
-        else:
-            stream = open_stream(messages, recovery_sampling=recovery_sampling)
-    except Exception:
-        spinner.stop()
-        raise
-    if stream is None:
-        spinner.stop()
-        return TURN_DONE  # error already reported; REPL continues
-
     # Interrupt watcher: the singleton daemon thread watches stdin for bare Esc
     # while ARMED. On hit it sets _USER_INTERRUPTED; the main loop breaks out of
-    # the chunk loop on its next iteration. We arm it BEFORE the spinner so the
-    # user always has a moment to interrupt even if the first token takes a
-    # while to arrive.
+    # the chunk loop on its next iteration. Armed BEFORE the request is sent:
+    # llama.cpp sends no response headers until the first token, so on a long
+    # prompt the request itself blocks for minutes and Esc must work there too
+    # (see _call_interruptibly).
     _ensure_interrupt_watcher()
     _USER_INTERRUPTED.clear()
     # Clear the "termios restored" flag BEFORE arming so we can wait on it
@@ -3206,6 +3285,30 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     # with broken Enter and garbled typing.
     _INTERRUPT_RESTORED.clear()
     _INTERRUPT_ARMED.set()
+    open_interrupted = False
+    try:
+        if forced_final:
+            stream = open_stream(
+                messages,
+                tools=[FINAL_ANSWER_TOOL],
+                tool_choice=FINAL_ANSWER_TOOL_CHOICE,
+                max_tokens=FORCED_FINAL_MAX_TOKENS,
+                recovery_sampling=recovery_sampling,
+            )
+        else:
+            stream = open_stream(messages, recovery_sampling=recovery_sampling)
+    except _RequestInterrupted:
+        spinner.stop()
+        stream, open_interrupted = iter(()), True  # fall through to the Esc path
+    except BaseException:
+        spinner.stop()
+        _disarm_interrupt_watcher()
+        raise
+    if stream is None:
+        spinner.stop()
+        _disarm_interrupt_watcher()
+        return TURN_DONE  # error already reported; REPL continues
+
     content, tcs, mode = [], {}, None
     reasoning_parts = []  # captured reasoning_content chunks (for stall feedback)
     timings = None
@@ -3216,7 +3319,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     reasoning_only_chars = 0
     reasoning_only_start = None  # wall-clock when reasoning-only streaming began
     stream_error = None
-    interrupted = False
+    interrupted = open_interrupted
     finish_reasons = []
     tool_status_active = False
     last_tool_status = 0.0
