@@ -2,6 +2,18 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — runs no longer stop after "Let me do X:"
+
+Right after a tool result, models (local quants especially) sometimes write the
+next step ("Let me settle the gate semantics from `FUN_80001ff8`:", "I'll run
+the tests now.") and end the turn without the tool call. Nothing ran, but the
+loop counted it as done, so unattended runs sat at the prompt for hours. The
+loop now spots a turn whose last line promises an action (ends in `:`, or says
+"let me / I'll / I'm going to / now I") and nudges the model to make the call.
+Questions and "let me know…" endings still stop. Retries are capped by
+`MINION_ANNOUNCED_STOP_RETRIES` (default 2, `0` disables) and reset after any
+real tool call.
+
 ### Added — OpenRouter built-in source with provider routing
 
 New built-in `openrouter` source auto-registers when `OPENROUTER_API_KEY` is
