@@ -20,6 +20,37 @@ in `~/.env`, or in the shell. `minion --features` shows what's on:
 | `MINION_ESC_WHILE_WAITING` | Esc works while the server is still reading a long prompt |
 | `MINION_ANNOUNCED_STOP` | carry on when the model says "let me X:" and stops without a tool call |
 | `MINION_MIDRUN_COMPRESS` | auto-compress between the steps of a long run, not only at the prompt |
+| `MINION_AGENTS` | `agent` tool: hand tasks to sub-agents that run at the same time |
+| `MINION_MCP_TOOLS` | tools from the MCP servers listed in the `MINION_MCP` file(s) |
+
+### Sub-agents
+
+The `agent` tool takes a list of tasks and starts one sub-agent per task, several at once
+(`MINION_AGENT_PARALLEL`, default 4). Each is a separate minion process in one-shot mode with
+a fresh context, the same tools, folder, source and approval level; an action that would need
+a Y/n prompt is refused, since an agent has no terminal. Only each agent's final report comes
+back into the main context; the full run is in `~/.minion/agent-logs/`. Agents can't start
+agents, and Esc stops them. For agents to really run in parallel the server needs as many
+slots (`llama-server -np N`, Strata `--parallel N`); otherwise they queue.
+
+### MCP servers
+
+Set `MINION_MCP` to a JSON file (several: separate with `:`) in the format Claude Code uses
+for `.mcp.json`:
+
+```json
+{"mcpServers": {
+  "git":    {"command": "uvx", "args": ["mcp-server-git"]},
+  "remote": {"type": "http", "url": "http://pve:9000/mcp",
+             "headers": {"Authorization": "Bearer ${MY_TOKEN}"}}}}
+```
+
+Local servers (`command`) run as child processes; remote ones (`url`) use Streamable HTTP.
+`${VAR}` is filled from the environment. Optional per server: `"tools": [...]` keeps only
+those tools (every tool description costs context; minion prints the cost at startup),
+`"disabled": true`, `"timeout": seconds`. Tools appear as `mcp__<server>__<tool>` and ask for
+approval like the built-in ones. Standard library only: no MCP package needed. Server
+stderr goes to `~/.minion/mcp-logs/`.
 
 Two plain bug fixes have no switch, since turning them off only breaks things: whitespace-only
 stream chunks are kept, and the context size counts llama.cpp's cached prompt tokens.

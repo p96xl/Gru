@@ -38,6 +38,7 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
 Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /memory save|remember|list  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
        --features  (list this fork's additions and their on/off switches)
+       MINION_MCP=<file.json>  (MCP servers, .mcp.json format; see "MCP servers" below)
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
        MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
        MINION_BACKEND=vllm  (disables llama.cpp-only recovery knobs like min_p /
@@ -116,6 +117,8 @@ FEATURES = (
     ("MINION_ESC_WHILE_WAITING", "1", "Esc works while the server is still reading a long prompt"),
     ("MINION_ANNOUNCED_STOP", "1", "carry on when the model says 'let me X:' then stops without a tool call"),
     ("MINION_MIDRUN_COMPRESS", "1", "auto-compress between the steps of a long run, not only at the prompt"),
+    ("MINION_AGENTS", "1", "agent tool: hand tasks to sub-agents that run at the same time"),
+    ("MINION_MCP_TOOLS", "1", "tools from the MCP servers listed in the MINION_MCP file(s)"),
 )
 _FEATURE_DEFAULTS = {name: default for name, default, _ in FEATURES}
 
@@ -2601,6 +2604,469 @@ def _env_float(name, default):
         return default
 
 
+# --- sub-agents (fork; switch: MINION_AGENTS) -------------------------------
+# The `agent` tool hands tasks to sub-agents. Each one is a separate minion
+# process in one-shot mode (--prompt-file), so it has a fresh context, its own
+# server connection and no shared state with this one, and several run at the
+# same time. It uses the same source and approval level as this session; an
+# action that would need a Y/n prompt is refused (an agent has no terminal).
+# Its whole run is logged under ~/.minion/agent-logs/, and only its final
+# report comes back into this context. Agents cannot start agents.
+#   MINION_AGENT_PARALLEL  most agents at once (default 4; the server needs as many
+#                          slots: llama-server -np N, Strata --parallel N)
+#   MINION_AGENT_REPORT_CHARS  longest report kept from each agent (default 6000)
+AGENT_DEPTH = _env_int("MINION_AGENT_DEPTH", 0)  # set to 1 for the agents themselves
+AGENT_PARALLEL = max(1, _env_int("MINION_AGENT_PARALLEL", 4))
+AGENT_REPORT_CHARS = _env_int("MINION_AGENT_REPORT_CHARS", 6000)
+AGENT_MAX_TASKS = 8
+AGENT_PREAMBLE = (
+    "You are a sub-agent: another agent gave you the task below and is waiting for your "
+    "report. Other agents may be working in the same folder at the same time, so only "
+    "change files your task is about. Work until the task is done (or you are truly "
+    "stuck), then reply with a short report: what you did, what you found, which files "
+    "you changed, and anything left open.\n\nTask:\n")
+
+AGENT_TOOL = {"type": "function", "function": {
+    "name": "agent",
+    "description": (
+        "Hand tasks to sub-agents that work while you wait, then return their reports. Each agent "
+        "starts with a fresh, empty context, has the same tools as you, and works in the same folder. "
+        "Several tasks run at the same time. Use it for independent pieces of work (investigate "
+        "one module each, try different fixes, write tests for separate files) or to keep long "
+        "searches out of your own context. Write each task so it stands alone: the agent sees "
+        "nothing of this conversation. Agents running at once must not edit the same files."),
+    "parameters": {"type": "object", "properties": {
+        "tasks": {"type": "array", "items": {"type": "string"},
+                  "description": f"one self-contained task per agent (at most {AGENT_MAX_TASKS})"},
+        "source": {"type": "string",
+                   "description": "optional: the source (server) the agents use; default: the current one"},
+    }, "required": ["tasks"]}}}
+
+
+def _agent_child_env(source_name):
+    env = dict(os.environ)
+    env["MINION_AGENT_DEPTH"] = str(AGENT_DEPTH + 1)
+    env["MINION_LIVE_INPUT"] = "0"
+    src = SOURCES.get(source_name)
+    if src is not None and src.model:  # a model picked with /source <name> <model> this session
+        if source_name == "local" and not any(k.startswith("MINION_SOURCE_") and k.endswith("_BASE_URL")
+                                              for k in os.environ):
+            env["MINION_MODEL"] = src.model
+        else:
+            env[f"MINION_SOURCE_{source_name.upper()}_MODEL"] = src.model
+    return env
+
+
+def _agent_approval_args():
+    if YOLO:
+        return ["--yolo"]
+    if APPROVE_LEVEL:
+        return ["--approval", APPROVE_LEVEL]
+    return ["--approval", "all"]
+
+
+def _agent_report(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
+    except OSError:
+        return ""
+    if len(text) > AGENT_REPORT_CHARS:
+        text = text[:AGENT_REPORT_CHARS] + f"\n... [report cut at {AGENT_REPORT_CHARS} chars; full run in the log]"
+    return text
+
+
+def _stop_agent(p):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            return
+        try:
+            p.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def agent(tasks=None, source=None, task=None, **_):
+    if isinstance(tasks, str):
+        tasks = [tasks]
+    tasks = [t.strip() for t in list(tasks or []) + ([task] if task else [])
+             if isinstance(t, str) and t.strip()]
+    if not tasks:
+        return "ERROR: agent needs `tasks`, a list with one self-contained task per agent"
+    if len(tasks) > AGENT_MAX_TASKS:
+        return f"ERROR: at most {AGENT_MAX_TASKS} tasks at once (got {len(tasks)})"
+    source = source or (ACTIVE.name if ACTIVE else None)
+    if source not in SOURCES:
+        return f"ERROR: no source named {source!r}; available: {', '.join(SOURCE_ORDER)}"
+    names = "; ".join(t if len(t) <= 70 else t[:67] + "..." for t in tasks)
+    if not _confirm(f"start {len(tasks)} agent(s) on {source}: {names}"):
+        return "DENIED by user"
+
+    log_dir = os.path.join(SESSION_HOME, "agent-logs")
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    env = _agent_child_env(source)
+    me = [sys.executable, os.path.abspath(__file__)]
+    jobs = []
+    for i, t in enumerate(tasks, 1):
+        base = os.path.join(log_dir, f"{stamp}-{i}")
+        with open(base + ".task", "w", encoding="utf-8") as f:
+            f.write(AGENT_PREAMBLE + t)
+        jobs.append({"n": i, "task": t, "base": base, "proc": None, "start": None, "end": None})
+
+    pending, running = list(jobs), []
+    own_arm = (_feature("MINION_ESC_IN_BASH") and not _INTERRUPT_ARMED.is_set()
+               and sys.stdin.isatty() and sys.stdout.isatty())
+    if own_arm:
+        _ensure_interrupt_watcher()
+        _USER_INTERRUPTED.clear()
+        _INTERRUPT_RESTORED.clear()
+        _INTERRUPT_ARMED.set()
+    interrupted = False
+    try:
+        while pending or running:
+            while pending and len(running) < AGENT_PARALLEL:
+                j = pending.pop(0)
+                cmd = me + ["--prompt-file", j["base"] + ".task", "--source", source] + _agent_approval_args()
+                child_env = dict(env, MINION_RESULT_FILE=j["base"] + ".report")
+                with open(j["base"] + ".log", "w") as log:
+                    j["proc"] = subprocess.Popen(cmd, cwd=os.getcwd(), env=child_env, stdin=subprocess.DEVNULL,
+                                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                j["start"] = time.time()
+                running.append(j)
+            for j in list(running):
+                if j["proc"].poll() is not None:
+                    j["end"] = time.time()
+                    running.remove(j)
+            sp = _ACTIVE_SPINNER
+            if sp is not None:
+                done = len(jobs) - len(pending) - len(running)
+                sp.label = f"agents: {len(running)} working, {done}/{len(jobs)} done"
+            if _USER_INTERRUPTED.is_set() and (own_arm or _INTERRUPT_ARMED.is_set()):
+                interrupted = True
+                break
+            time.sleep(0.25)
+    finally:
+        if own_arm:
+            _INTERRUPT_ARMED.clear()
+            _INTERRUPT_RESTORED.wait(timeout=0.5)
+        for j in running:
+            _stop_agent(j["proc"])
+            j["end"] = time.time()
+
+    out = []
+    for j in jobs:
+        head = j["task"] if len(j["task"]) <= 100 else j["task"][:97] + "..."
+        p = j["proc"]
+        if p is None:
+            state = "not started (stopped by user)"
+        elif p.returncode in (0, None) and not (interrupted and j in running):
+            state = f"finished in {int((j['end'] or time.time()) - j['start'])}s"
+        else:
+            state = f"stopped (exit {p.returncode})"
+        report = _agent_report(j["base"] + ".report") if p is not None else ""
+        out.append(f"## Agent {j['n']}: {head}\n[{state}; full run: {j['base']}.log]\n"
+                   + (report or "(no report)"))
+    if interrupted:
+        out.append("The user pressed Esc: unfinished agents were stopped.")
+    return "\n\n".join(out)
+
+
+if _feature("MINION_AGENTS") and AGENT_DEPTH == 0:
+    DISPATCH["agent"] = agent
+    TOOLS.append(AGENT_TOOL)
+
+
+# --- MCP servers (fork; switch: MINION_MCP_TOOLS) ---------------------------
+# MINION_MCP names one or more JSON files (separated by ":") in the format
+# Claude Code uses for .mcp.json:
+#   {"mcpServers": {
+#      "git":    {"command": "uvx", "args": ["mcp-server-git"], "env": {"X": "${HOME}"}},
+#      "remote": {"type": "http", "url": "http://pve:9000/mcp", "headers": {"Authorization": "Bearer ${TOKEN}"}}}}
+# ${VAR} is filled from the environment. Optional per server: "tools": [names] keeps only
+# those tools (each tool's description costs context), "disabled": true skips the server,
+# "timeout": seconds per call (default MINION_MCP_TIMEOUT, 120).
+# Each tool shows up as mcp__<server>__<tool> and asks for approval like the built-in
+# tools. Local servers (command) run as child processes, inside the sandbox if minion is
+# in one; remote ones speak Streamable HTTP. Plain stdlib, no MCP package needed.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_TIMEOUT = _env_int("MINION_MCP_TIMEOUT", 120)
+MCP_SERVERS = {}
+
+
+def _mcp_expand(value):
+    if isinstance(value, str):
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+                      lambda m: os.environ.get(m.group(1), m.group(2) or ""), value)
+    if isinstance(value, list):
+        return [_mcp_expand(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _mcp_expand(v) for k, v in value.items()}
+    return value
+
+
+class _McpServer:
+    """One MCP server, over stdio (a child process) or Streamable HTTP."""
+
+    def __init__(self, name, cfg):
+        self.name, self.cfg = name, _mcp_expand(cfg)
+        self.timeout = self.cfg.get("timeout") or MCP_TIMEOUT
+        self.http = bool(self.cfg.get("url"))
+        self.proc = None
+        self.session_id = None
+        self._next_id = 0
+        self._lock = threading.Lock()
+        self._waiting = {}  # id -> [Event, response]
+        self.tools = []
+
+    # --- transport
+    def start(self):
+        if self.http:
+            return
+        cmd = [self.cfg["command"]] + [str(a) for a in self.cfg.get("args", [])]
+        env = dict(os.environ, **{k: str(v) for k, v in (self.cfg.get("env") or {}).items()})
+        log_dir = os.path.join(SESSION_HOME, "mcp-logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.stderr = open(os.path.join(log_dir, f"{self.name}.log"), "a")
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
+                                     env=env, cwd=self.cfg.get("cwd") or None, start_new_session=True)
+        threading.Thread(target=self._read_stdio, daemon=True).start()
+
+    def _send_stdio(self, msg):
+        data = (json.dumps(msg) + "\n").encode()
+        with self._lock:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+
+    def _read_stdio(self):
+        for raw in self.proc.stdout:
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue  # servers sometimes print stray lines
+            self._handle(msg)
+        for slot in list(self._waiting.values()):  # the server exited: wake every waiter
+            slot[1] = {"error": {"message": f"MCP server {self.name} exited"}}
+            slot[0].set()
+
+    def _handle(self, msg):
+        if "method" in msg and "id" in msg:  # a request from the server
+            self._reply(msg)
+        elif "id" in msg:
+            slot = self._waiting.get(msg["id"])
+            if slot:
+                slot[1] = msg
+                slot[0].set()
+
+    def _reply(self, req):
+        if req["method"] == "ping":
+            resp = {"jsonrpc": "2.0", "id": req["id"], "result": {}}
+        elif req["method"] == "roots/list":
+            cwd = os.getcwd()
+            resp = {"jsonrpc": "2.0", "id": req["id"],
+                    "result": {"roots": [{"uri": "file://" + cwd, "name": os.path.basename(cwd) or cwd}]}}
+        else:
+            resp = {"jsonrpc": "2.0", "id": req["id"],
+                    "error": {"code": -32601, "message": f"minion does not support {req['method']}"}}
+        if self.http:
+            self._post(resp)
+        else:
+            self._send_stdio(resp)
+
+    def _post(self, msg, want_id=None):
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                   "MCP-Protocol-Version": MCP_PROTOCOL_VERSION}
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        headers.update({k: str(v) for k, v in (self.cfg.get("headers") or {}).items()})
+        req = urllib.request.Request(self.cfg["url"], json.dumps(msg).encode(), headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                self.session_id = sid
+            if want_id is None:
+                return None
+            if "text/event-stream" in (resp.headers.get("Content-Type") or ""):
+                data = []
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith("data:"):
+                        data.append(line[5:].lstrip())
+                    elif not line and data:
+                        try:
+                            ev = json.loads("\n".join(data))
+                        except ValueError:
+                            ev = {}
+                        data = []
+                        if ev.get("id") == want_id and "method" not in ev:
+                            return ev
+                        if "method" in ev and "id" in ev:
+                            self._reply(ev)
+                return {"error": {"message": "the server's stream ended without an answer"}}
+            body = resp.read()
+            return json.loads(body) if body.strip() else {"error": {"message": "empty answer"}}
+
+    def request(self, method, params=None, timeout=None):
+        with self._lock:
+            self._next_id += 1
+            rid = self._next_id
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}
+        if self.http:
+            resp = self._post(msg, want_id=rid)
+        else:
+            slot = self._waiting[rid] = [threading.Event(), None]
+            try:
+                self._send_stdio(msg)
+                if not slot[0].wait(timeout or self.timeout):
+                    raise TimeoutError(f"no answer to {method} in {timeout or self.timeout}s")
+                resp = slot[1]
+            finally:
+                self._waiting.pop(rid, None)
+        if resp.get("error"):
+            raise RuntimeError(resp["error"].get("message") or str(resp["error"]))
+        return resp.get("result") or {}
+
+    def notify(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params:
+            msg["params"] = params
+        if self.http:
+            self._post(msg)
+        else:
+            self._send_stdio(msg)
+
+    # --- protocol
+    def connect(self):
+        self.start()
+        self.request("initialize", {"protocolVersion": MCP_PROTOCOL_VERSION,
+                                    "capabilities": {"roots": {"listChanged": False}},
+                                    "clientInfo": {"name": "minion", "version": "1"}}, timeout=60)
+        self.notify("notifications/initialized")
+        tools, cursor = [], None
+        while True:
+            res = self.request("tools/list", {"cursor": cursor} if cursor else {}, timeout=60)
+            tools += res.get("tools") or []
+            cursor = res.get("nextCursor")
+            if not cursor:
+                break
+        keep = self.cfg.get("tools")
+        self.tools = [t for t in tools if not keep or t.get("name") in keep]
+
+    def call(self, tool, args):
+        res = self.request("tools/call", {"name": tool, "arguments": args})
+        parts = []
+        for c in res.get("content") or []:
+            kind = c.get("type")
+            if kind == "text":
+                parts.append(c.get("text", ""))
+            elif kind == "resource":
+                r = c.get("resource") or {}
+                parts.append(r.get("text") or f"[resource {r.get('uri', '')}]")
+            elif kind == "resource_link":
+                parts.append(f"[resource {c.get('uri', '')}] {c.get('name', '')}".rstrip())
+            else:  # image, audio: this agent reads text only
+                parts.append(f"[{kind} ({c.get('mimeType', '?')}), not shown]")
+        if not parts and res.get("structuredContent") is not None:
+            parts.append(json.dumps(res["structuredContent"], indent=1))
+        text = "\n".join(parts) or "(no output)"
+        return ("ERROR: " + text) if res.get("isError") else text
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        if self.http and self.session_id:
+            try:
+                req = urllib.request.Request(self.cfg["url"], method="DELETE",
+                                             headers={"Mcp-Session-Id": self.session_id})
+                urllib.request.urlopen(req, timeout=3).close()
+            except Exception:  # noqa: BLE001 — best effort on the way out
+                pass
+
+
+def _mcp_tool_name(server, tool):
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", f"mcp__{server}__{tool}")
+    return name[:64]
+
+
+def _mcp_dispatcher(srv, tool):
+    def call(**args):
+        preview = json.dumps(args)
+        if len(preview) > 200:
+            preview = preview[:197] + "..."
+        if not _confirm(f"mcp {srv.name}.{tool} {preview}"):
+            return "DENIED by user"
+        return srv.call(tool, args)
+    return call
+
+
+def _mcp_setup():
+    """Connect to every server in the MINION_MCP files and add their tools. Once per process."""
+    files = [p for p in os.environ.get("MINION_MCP", "").split(":") if p.strip()]
+    if MCP_SERVERS or not files or not _feature("MINION_MCP_TOOLS"):
+        return
+    configs = {}
+    for path in files:
+        path = os.path.expanduser(path.strip())
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"{YELLOW}  mcp: can't read {path}: {e}{RESET}")
+            continue
+        for name, cfg in (data.get("mcpServers", data) or {}).items():
+            if isinstance(cfg, dict) and not cfg.get("disabled"):
+                configs[name] = cfg
+    results = {}
+
+    def connect(name, cfg):
+        kind = cfg.get("type", "http" if cfg.get("url") else "stdio")
+        if kind == "sse":
+            results[name] = "the old SSE transport isn't supported; use the server's Streamable HTTP URL"
+            return
+        if kind not in ("stdio", "http", "streamable-http") or not (cfg.get("command") or cfg.get("url")):
+            results[name] = f"needs \"command\" (local) or \"url\" (http); type {kind!r} isn't supported"
+            return
+        srv = _McpServer(name, cfg)
+        try:
+            srv.connect()
+            results[name] = srv
+        except Exception as e:  # noqa: BLE001 — one broken server must not stop minion
+            srv.close()
+            results[name] = f"{type(e).__name__}: {e}"
+
+    threads = [threading.Thread(target=connect, args=(n, c), daemon=True) for n, c in configs.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=90)
+    for name in configs:
+        srv = results.get(name, "no answer in 90 s")
+        if isinstance(srv, str):
+            print(f"{YELLOW}  mcp: {name} not connected: {srv}{RESET}")
+            continue
+        MCP_SERVERS[name] = srv
+        for t in srv.tools:
+            tname = _mcp_tool_name(name, t["name"])
+            DISPATCH[tname] = _mcp_dispatcher(srv, t["name"])
+            TOOLS.append({"type": "function", "function": {
+                "name": tname, "description": (t.get("description") or t.get("title") or t["name"])[:1024],
+                "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}})
+        size = sum(len(json.dumps(t)) for t in srv.tools)
+        print(f"{DIM}  mcp: {name} — {len(srv.tools)} tools (~{size // 4} tokens of tool descriptions){RESET}")
+    import atexit
+    atexit.register(lambda: [s.close() for s in MCP_SERVERS.values()])
+
+
 # --- usage metrics (default off) --------------------------------------------
 # minion already captures every model call's token usage (the streaming
 # `usage` object from OpenAI/Z.ai, plus llama.cpp's `timings`) to print the
@@ -3226,7 +3692,11 @@ def _ask_approval_key(prompt):
     mode) and as the letter 'e'/'E' for terminals where raw mode isn't
     usable. Falls back to line-based `input()` when stdin isn't a TTY."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        ans = input(prompt).strip().lower()
+        try:
+            ans = input(prompt).strip().lower()
+        except EOFError:  # nobody to ask (a sub-agent, stdin closed): refuse
+            print("n (no one to ask)")
+            return "n"
         if ans in ("esc", "e", "\x1b"):
             return "esc"
         if ans == "n":
@@ -5075,11 +5545,31 @@ def _run_one_shot():
         _run_model_turn_loop(messages, on_step=None)
     except KeyboardInterrupt:
         sys.stderr.write("\n[minion] interrupted\n")
+        _write_result_file(messages)
         sys.exit(130)
     except Exception as e:
         sys.stderr.write(f"\n[minion] error: {type(e).__name__}: {e}\n")
+        _write_result_file(messages)
         sys.exit(1)
+    _write_result_file(messages)
     sys.exit(0)
+
+
+def _write_result_file(messages):
+    """MINION_RESULT_FILE (set for sub-agents): write the last answer there."""
+    path = os.environ.get("MINION_RESULT_FILE")
+    if not path:
+        return
+    text = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), str) and msg["content"].strip():
+            text = RUNTIME_NOTE_RE.sub("", msg["content"]).strip()
+            break
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
 
 
 def main():
@@ -5087,6 +5577,7 @@ def main():
     if "--features" in sys.argv[1:]:
         _print_features()
         return
+    _mcp_setup()
     # --prompt-file: headless single-shot mode — run one turn and exit.
     if _run_one_shot():
         return
