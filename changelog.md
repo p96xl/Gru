@@ -2,6 +2,17 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — Esc did nothing until the first token arrived
+
+llama.cpp sends no response headers for a streamed completion until it has
+processed the prompt, so on a long context `create()` blocked for minutes (half
+an hour at 130K tokens on a slow box) and Esc was only checked once chunks
+arrived; Ctrl+C was the only way out. The request now runs on a helper thread
+while the Esc watcher is armed (it is now armed before the request is sent).
+Esc closes the connection, which also makes llama.cpp cancel the prompt
+processing, and minion drops back to the prompt at once. The OpenAI SDK's
+automatic retry of a dropped connection is blocked for abandoned requests, so
+the prompt isn't quietly re-sent.
 ### Fixed — auto-compress never fired on long llama.cpp runs
 
 Two bugs kept long unattended runs from compressing until the window was full

@@ -386,7 +386,9 @@ terminals under 10 rows, or with `MINION_LIVE_INPUT=0`.
 ## Interrupting the model
 
 Press **Esc** at any point during generation to stop the model and drop back to
-the prompt. The stream is closed, partial output is discarded, and a synthetic
+the prompt. That includes the wait before the first token, which on a long
+local context can take minutes: the connection is closed, so llama.cpp stops
+processing the prompt too. The stream is closed, partial output is discarded, and a synthetic
 "you were interrupted" note is appended to context so the model knows what
 happened. In-flight tool calls are **not** cancelled: Esc while `run_bash` (or
 `wait_background`) waits on a command stops the waiting, and the command keeps
