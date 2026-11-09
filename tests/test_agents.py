@@ -140,3 +140,20 @@ def test_approval_flags_follow_this_session():
         assert m._agent_approval_args() == ["--approval", "all"]
     finally:
         m.YOLO, m.APPROVE_LEVEL = saved
+
+
+def test_agent_source_setting_picks_the_default():
+    saved = (m.AGENT_SOURCE, dict(m.SOURCES), list(m.SOURCE_ORDER))
+    try:
+        m.SOURCES["vega"] = m.Source("vega", "http://127.0.0.1:1/v1", "sk-noop", "small")
+        m.SOURCE_ORDER.append("vega")
+        m.AGENT_SOURCE = "vega"
+        assert m._agent_default_source() == "vega"
+        help_text = m._agent_source_help()
+        assert "vega (small)" in help_text and help_text.endswith("Default: vega")
+        m.AGENT_SOURCE = "missing"  # e.g. the second server did not start: fall back to the current one
+        assert m._agent_default_source() == m.ACTIVE.name
+    finally:
+        m.AGENT_SOURCE = saved[0]
+        m.SOURCES.clear(); m.SOURCES.update(saved[1])
+        m.SOURCE_ORDER[:] = saved[2]

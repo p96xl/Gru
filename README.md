@@ -22,6 +22,8 @@ in `~/.env`, or in the shell. `minion --features` shows what's on:
 | `MINION_MIDRUN_COMPRESS` | auto-compress between the steps of a long run, not only at the prompt |
 | `MINION_AGENTS` | `agent` tool: hand tasks to sub-agents that run at the same time |
 | `MINION_MCP_TOOLS` | tools from the MCP servers listed in the `MINION_MCP` file(s) |
+| `MINION_BG_COMPACT` | live compaction: the helper model summarizes old turns in the background |
+| `MINION_BG_REVIEW` | background review: the helper model reviews each edit while work goes on |
 
 ### Sub-agents
 
@@ -32,6 +34,27 @@ a Y/n prompt is refused, since an agent has no terminal. Only each agent's final
 back into the main context; the full run is in `~/.minion/agent-logs/`. Agents can't start
 agents, and Esc stops them. For agents to really run in parallel the server needs as many
 slots (`llama-server -np N`, Strata `--parallel N`); otherwise they queue.
+
+Agents use the current source unless `MINION_AGENT_SOURCE` names another, for example a
+second server on another card; the model can still pick any source per call, and the tool
+lists them. If the named source isn't there, agents fall back to the current one.
+
+### A helper model beside the main one
+
+`MINION_HELPER_SOURCE` names a second source, for example a small fast model on another card.
+It does work the main model would otherwise stop for, and the main model never waits on it:
+
+- **Live compaction.** Once the context passes `MINION_BG_COMPACT_START` percent of the window
+  (default 50), the helper summarizes the oldest turns in the background, chunk by chunk
+  (`MINION_BG_CHUNK_CHARS`, default 60000), into one running summary. When auto-compress
+  triggers, that summary replaces those turns at once. The recent third stays verbatim, as with
+  auto-compress. If the helper isn't ready, the main model compresses as before.
+- **Review.** Each `write_file` / `edit_file` is sent to the helper as a diff while the main
+  model works on. Problems come back as a note the model checks; "nothing to fix" stays quiet.
+  When the model is done, minion waits up to `MINION_REVIEW_WAIT` seconds (default 30, 0 =
+  never) for a review still running. At most 2 review notes extend one run.
+
+Neither runs for sub-agents or when the helper is the source in use.
 
 ### MCP servers
 

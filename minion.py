@@ -39,6 +39,7 @@ Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /y
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
        --features  (list this fork's additions and their on/off switches)
        MINION_MCP=<file.json>  (MCP servers, .mcp.json format; see "MCP servers" below)
+       MINION_HELPER_SOURCE=<source>  (a second model for live compaction and edit review)
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
        MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
        MINION_BACKEND=vllm  (disables llama.cpp-only recovery knobs like min_p /
@@ -119,6 +120,8 @@ FEATURES = (
     ("MINION_MIDRUN_COMPRESS", "1", "auto-compress between the steps of a long run, not only at the prompt"),
     ("MINION_AGENTS", "1", "agent tool: hand tasks to sub-agents that run at the same time"),
     ("MINION_MCP_TOOLS", "1", "tools from the MCP servers listed in the MINION_MCP file(s)"),
+    ("MINION_BG_COMPACT", "1", "live compaction: the MINION_HELPER_SOURCE model summarizes old turns in the background"),
+    ("MINION_BG_REVIEW", "1", "background review: the MINION_HELPER_SOURCE model reviews each edit while work goes on"),
 )
 _FEATURE_DEFAULTS = {name: default for name, default, _ in FEATURES}
 
@@ -2615,10 +2618,13 @@ def _env_float(name, default):
 #   MINION_AGENT_PARALLEL  most agents at once (default 4; the server needs as many
 #                          slots: llama-server -np N, Strata --parallel N)
 #   MINION_AGENT_REPORT_CHARS  longest report kept from each agent (default 6000)
+#   MINION_AGENT_SOURCE    the source agents use unless the model names one (default: the
+#                          current one), e.g. a second server on another card
 AGENT_DEPTH = _env_int("MINION_AGENT_DEPTH", 0)  # set to 1 for the agents themselves
 AGENT_PARALLEL = max(1, _env_int("MINION_AGENT_PARALLEL", 4))
 AGENT_REPORT_CHARS = _env_int("MINION_AGENT_REPORT_CHARS", 6000)
 AGENT_MAX_TASKS = 8
+AGENT_SOURCE = os.environ.get("MINION_AGENT_SOURCE", "").strip()
 AGENT_PREAMBLE = (
     "You are a sub-agent: another agent gave you the task below and is waiting for your "
     "report. Other agents may be working in the same folder at the same time, so only "
@@ -2641,6 +2647,19 @@ AGENT_TOOL = {"type": "function", "function": {
         "source": {"type": "string",
                    "description": "optional: the source (server) the agents use; default: the current one"},
     }, "required": ["tasks"]}}}
+
+
+def _agent_default_source():
+    if AGENT_SOURCE in SOURCES:
+        return AGENT_SOURCE
+    return ACTIVE.name if ACTIVE else None
+
+
+def _agent_source_help():
+    """The `source` parameter's description: what there is to pick from, and the default."""
+    names = ", ".join(f"{n} ({SOURCES[n].model})" if SOURCES[n].model else n for n in SOURCE_ORDER)
+    default = AGENT_SOURCE if AGENT_SOURCE in SOURCES else "the one you are on"
+    return f"optional: the source (server) the agents use. Available: {names}. Default: {default}"
 
 
 def _agent_child_env(source_name):
@@ -2698,7 +2717,7 @@ def agent(tasks=None, source=None, task=None, **_):
         return "ERROR: agent needs `tasks`, a list with one self-contained task per agent"
     if len(tasks) > AGENT_MAX_TASKS:
         return f"ERROR: at most {AGENT_MAX_TASKS} tasks at once (got {len(tasks)})"
-    source = source or (ACTIVE.name if ACTIVE else None)
+    source = source or _agent_default_source()
     if source not in SOURCES:
         return f"ERROR: no source named {source!r}; available: {', '.join(SOURCE_ORDER)}"
     names = "; ".join(t if len(t) <= 70 else t[:67] + "..." for t in tasks)
@@ -2776,6 +2795,10 @@ def agent(tasks=None, source=None, task=None, **_):
 
 
 if _feature("MINION_AGENTS") and AGENT_DEPTH == 0:
+    if AGENT_SOURCE and AGENT_SOURCE not in SOURCES:
+        sys.stderr.write(f"minion: MINION_AGENT_SOURCE={AGENT_SOURCE} is not a source here; "
+                         "agents use the current one\n")
+    AGENT_TOOL["function"]["parameters"]["properties"]["source"]["description"] = _agent_source_help()
     DISPATCH["agent"] = agent
     TOOLS.append(AGENT_TOOL)
 
@@ -3923,8 +3946,10 @@ def run_tool(name, args):
     spinner.start()
     global _ACTIVE_SPINNER
     _ACTIVE_SPINNER = spinner
+    review_before = _BG_REVIEW.before_tool(name, args)
     try:
         result = fn(**args)
+        _BG_REVIEW.after_tool(name, args, review_before, result)
     except _EscToChat:
         # Close the tool box before propagating so it isn't left visually open.
         print(f"{CYAN}  └─{RESET} {DIM}(escaped){RESET}")
@@ -4235,6 +4260,9 @@ def _maybe_autocompress(messages, prompt_tokens):
         return False
     mx = ACTIVE._context_window
     ratio = prompt_tokens / mx
+    removed = _BG_COMPACT.apply(messages)
+    if removed and not _over_autocompress_threshold(prompt_tokens - int(removed / 3.5)):
+        return True
     result = compress(messages, auto=True)
     if result is None:
         return False
@@ -4244,6 +4272,307 @@ def _maybe_autocompress(messages, prompt_tokens):
           f"({summary_chars} chars), kept last {kept_n} verbatim "
           f"(context was at {pct}% of {_abbr(mx)}){RESET}")
     return True
+
+
+# --- background helpers on a second server (fork; switches: MINION_BG_COMPACT, MINION_BG_REVIEW)
+# A second source (MINION_HELPER_SOURCE, e.g. a small fast model on another card) works beside
+# the main model, and the main model never waits on it:
+#   live compaction  once the context passes MINION_BG_COMPACT_START % of the window, the helper
+#                    summarizes the oldest turns in the background, chunk by chunk, into one
+#                    running summary. When auto-compress triggers, that summary replaces those
+#                    turns at once instead of the main model stopping to write one. If the helper
+#                    isn't ready, auto-compress runs on the main model as before.
+#   review           edits made with write_file / edit_file are sent to the helper as a diff
+#                    while the main model keeps working. Problems it finds come back as a note.
+#                    When the run ends, minion waits up to MINION_REVIEW_WAIT seconds (default 30;
+#                    0 = never) for a review still running, so the model can act on it.
+# Nothing runs when the helper source isn't set, is the source in use, or for sub-agents.
+HELPER_SOURCE = os.environ.get("MINION_HELPER_SOURCE", "").strip()
+BG_COMPACT_START = _env_int("MINION_BG_COMPACT_START", 50)
+BG_CHUNK_CHARS = _env_int("MINION_BG_CHUNK_CHARS", 60000)  # per helper call; ~17K tokens
+REVIEW_WAIT = _env_int("MINION_REVIEW_WAIT", 30)
+REVIEW_ROUNDS = 2       # review notes that may extend one run, so fix → review → fix can't loop
+REVIEW_DIFF_CHARS = 60000
+_NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}  # summaries and reviews don't need it
+
+
+def _helper_source():
+    if AGENT_DEPTH > 0 or not HELPER_SOURCE:
+        return None
+    src = SOURCES.get(HELPER_SOURCE)
+    if src is None or (ACTIVE is not None and src.name == ACTIVE.name):
+        return None
+    return src
+
+
+def _helper_ask(src, prompt, purpose):
+    """One non-streamed request to the helper (runs in a background thread). Returns the text."""
+    body = dict(_NO_THINKING)
+    body.update((src.extra_request_kwargs() or {}).get("extra_body") or {})
+    payload = [{"role": "user", "content": prompt}]
+    _log_event("req", {"model": src.resolve_model(), "_purpose": purpose, "_source": src.name,
+                       "messages": payload, "stream": False})
+    resp = src.client.chat.completions.create(model=src.resolve_model(), messages=payload, stream=False,
+                                              timeout=900, extra_body=body)
+    text = (resp.choices[0].message.content or "").strip()
+    _log_event("resp", {"_purpose": purpose, "_source": src.name, "text": text})
+    return text
+
+
+def _bg_render(msgs):
+    """Messages as plain text for the helper (tool outputs cut, like compress())."""
+    out = []
+    for m in msgs:
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if m.get("tool_calls"):
+            calls = ", ".join(f"{c['function']['name']}({c['function']['arguments'][:500]})"
+                              for c in m["tool_calls"])
+            out.append(f"[{m.get('role')}] {(content or '')[:2000]} → {calls}".rstrip())
+        else:
+            out.append(f"[{m.get('role', '?')}] {(content or '')[:2000]}")
+    return "\n\n".join(out)
+
+
+class _BgCompact:
+    """The running summary of messages[1:1+len(covered)], built by the helper in the background."""
+
+    def __init__(self):
+        self.covered = ()        # the message objects the summary stands for, in order
+        self.summary = None
+        self.thread = None
+        self.result = None       # (covered, summary) or ("error", text) from the thread
+        self.notice = None
+
+    def reset(self):
+        self.covered, self.summary, self.result = (), None, None
+
+    def _matches(self, messages):
+        n = len(self.covered)
+        return (len(messages) > n and all(a is b for a, b in zip(messages[1:1 + n], self.covered)))
+
+    def _harvest(self):
+        if self.thread is None or self.thread.is_alive():
+            return
+        self.thread, result, self.result = None, self.result, None
+        if not result:
+            return
+        if result[0] == "error":
+            self.notice = f"background compaction on {HELPER_SOURCE} failed: {result[1]}"
+        else:
+            self.covered, self.summary = result
+
+    def tick(self, messages, est_tokens):
+        """After a step: pick up a finished chunk, start the next one when it's time."""
+        if not _feature("MINION_BG_COMPACT"):
+            return
+        src = _helper_source()
+        if src is None or not messages or messages[0].get("role") != "system":
+            return
+        self._harvest()
+        if self.notice:
+            print(f"{DIM}  {self.notice}{RESET}")
+            self.notice = None
+        if self.thread is not None:
+            return
+        if self.covered and not self._matches(messages):
+            self.reset()  # the history changed under the summary (/compress, a loaded session, ...)
+        mx = ACTIVE._context_window if ACTIVE else None
+        if not isinstance(mx, int) or mx <= 0 or not est_tokens or est_tokens * 100 / mx < BG_COMPACT_START:
+            return
+        body_len = len(messages) - 1
+        limit = len(messages) - max(COMPRESS_KEEP, body_len // 3)  # the recent third stays verbatim
+        start = 1 + len(self.covered)
+        end, chars = start, 0
+        while end < limit and (chars < BG_CHUNK_CHARS or end == start):
+            chars += len(_bg_render([messages[end]]))
+            end += 1
+        # The kept part must start on a turn the chat template can render after a summary
+        while end > start and messages[end].get("role") not in ("user", "assistant"):
+            end -= 1
+        if end <= start or chars < 4000:
+            return
+        chunk = _bg_render(messages[start:end])
+        covered = tuple(messages[1:end])
+        previous = self.summary
+        prompt = (
+            "You keep a running summary of a coding agent's session so the agent can drop old turns. "
+            "Preserve: the user's goal and task, key decisions, file paths and identifiers touched, "
+            "commands that worked or failed (with the error), current state of the work, and open "
+            "questions. Drop raw tool output, full file contents and back-and-forth. Dense and "
+            "information-rich. Output ONLY the updated summary.\n\n"
+            + (f"Summary so far:\n---\n{previous}\n---\n\n" if previous else "")
+            + f"New turns to fold in:\n---\n{chunk}\n---")
+
+        def work():
+            try:
+                text = _helper_ask(src, prompt, "bg-compact")
+                self.result = (covered, text) if text else ("error", "empty summary")
+            except Exception as e:  # noqa: BLE001 — reported on the next tick
+                self.result = ("error", f"{type(e).__name__}: {e}")
+
+        self.thread = threading.Thread(target=work, daemon=True)
+        self.thread.start()
+
+    def apply(self, messages):
+        """At the auto-compress point: swap the summarized turns for the ready summary.
+        Returns the number of characters removed, or 0 when there was nothing usable."""
+        if not _feature("MINION_BG_COMPACT") or _helper_source() is None:
+            return 0
+        self._harvest()
+        if not self.summary or len(self.covered) < 2 or not self._matches(messages):
+            return 0
+        n = len(self.covered)
+        removed = sum(len(str(m.get("content") or "")) + sum(
+            len(str((tc.get("function") or {}).get("arguments") or "")) for tc in m.get("tool_calls") or [])
+            for m in self.covered)
+        header = (f"[Compressed context — {n} earlier turns summarized in the background by "
+                  f"{HELPER_SOURCE}; the turns after this are verbatim]")
+        note = {"role": "user", "content": f"{header}\n\n{self.summary}"}
+        messages[:] = [messages[0], note] + messages[1 + n:]
+        self.covered = (note,)
+        print(f"{DIM}  ↻ swapped {n} older turns for the summary {HELPER_SOURCE} wrote in the "
+              f"background ({len(self.summary)} chars){RESET}")
+        return max(0, removed - len(self.summary))
+
+
+_BG_COMPACT = _BgCompact()
+
+
+class _BgReview:
+    """Diffs of the files the model edited, reviewed by the helper while the model works on."""
+
+    EDIT_TOOLS = ("write_file", "edit_file")
+
+    def __init__(self):
+        self.pending = {}        # path → (text before the first unreviewed edit, text now)
+        self.thread = None
+        self.result = None
+        self.rounds = 0          # review notes delivered in this run
+
+    def enabled(self):
+        return _feature("MINION_BG_REVIEW") and _helper_source() is not None
+
+    @staticmethod
+    def _read(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def before_tool(self, name, args):
+        if name in self.EDIT_TOOLS and self.enabled() and isinstance(args.get("path"), str):
+            return self._read(args["path"])
+        return None
+
+    def after_tool(self, name, args, before, result):
+        if before is None or str(result).startswith(("ERROR", "DENIED")):
+            return
+        path = args["path"]
+        first = self.pending.get(path, (before, None))[0]
+        self.pending[path] = (first, self._read(path))
+
+    def _diff(self):
+        import difflib
+        parts = []
+        for path, (old, new) in self.pending.items():
+            d = "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                                             f"a/{path}", f"b/{path}", n=3))
+            if d:
+                parts.append(d)
+        return "\n".join(parts)[:REVIEW_DIFF_CHARS]
+
+    @staticmethod
+    def _task(messages):
+        for m in reversed(messages):
+            c = m.get("content")
+            if m.get("role") == "user" and isinstance(c, str) and not c.startswith("["):
+                return c[:3000]
+        return "(unknown)"
+
+    def start(self, messages):
+        """Send the edits made since the last review, unless one is still running."""
+        if not self.pending or self.thread is not None or not self.enabled():
+            return
+        diff = self._diff()
+        self.pending = {}
+        if not diff.strip():
+            return
+        src = _helper_source()
+        prompt = (
+            "You review code changes a coding agent just made, while it keeps working. Judge only "
+            "the code in the diff: bugs, wrong logic, unhandled cases that matter, broken syntax or "
+            "imports, or code that does the opposite of the task. The agent may still be running, "
+            "testing or doing other parts of the task, so never report missing steps, missing runs "
+            "or missing output. Be specific (file, line, why) and brief. No style remarks, no praise. "
+            "If there is nothing worth fixing, reply exactly: LGTM\n\n"
+            f"The task:\n---\n{self._task(messages)}\n---\n\nThe changes:\n```diff\n{diff}\n```")
+
+        def work():
+            try:
+                self.result = ("ok", _helper_ask(src, prompt, "bg-review"))
+            except Exception as e:  # noqa: BLE001
+                self.result = ("error", f"{type(e).__name__}: {e}")
+
+        self.thread = threading.Thread(target=work, daemon=True)
+        self.thread.start()
+
+    def deliver(self, messages):
+        """Put a finished review into the conversation. Returns True when it reported problems."""
+        if self.thread is None or self.thread.is_alive():
+            return False
+        self.thread, result, self.result = None, self.result, None
+        if not result:
+            return False
+        kind, text = result
+        if kind == "error":
+            print(f"{DIM}  review on {HELPER_SOURCE} failed: {text}{RESET}")
+            return False
+        last = text.strip().splitlines()[-1].strip(" *`.!").upper() if text.strip() else ""
+        if not text or last == "LGTM" or self.rounds >= REVIEW_ROUNDS:  # "LGTM" may follow a few words
+            print(f"{DIM}  ✓ {HELPER_SOURCE} reviewed the edits: nothing to fix{RESET}"
+                  if self.rounds < REVIEW_ROUNDS else f"{DIM}  (review ignored: limit per run){RESET}")
+            return False
+        self.rounds += 1
+        print(f"{MAGENTA}  ↳ review from {HELPER_SOURCE}:{RESET}")
+        for line in text.splitlines()[:12]:
+            print(f"{DIM}    {line[:160]}{RESET}")
+        _log_event("bg-review", text)
+        _append_user_note(messages,
+            f"[Review of your recent edits by a second model ({HELPER_SOURCE}), made in the "
+            "background. It can be wrong: check each point, fix what is real, and say briefly "
+            "which points you dismissed.]\n" + text)
+        return True
+
+    def step(self, messages):
+        """Between steps: deliver a finished review, then start one for new edits."""
+        if not self.enabled():
+            return
+        self.deliver(messages)
+        self.start(messages)
+
+    def finish(self, messages):
+        """When the model says it's done: review what's left, wait a little for it.
+        Returns True when the run should go on (the review found something)."""
+        if not self.enabled():
+            return False
+        self.start(messages)
+        if self.thread is not None and REVIEW_WAIT > 0:
+            spinner = LifeSpinner(label=f"waiting for the review on {HELPER_SOURCE}")
+            spinner.start()
+            try:
+                t0 = time.time()
+                while (self.thread.is_alive() and time.time() - t0 < REVIEW_WAIT
+                       and not _USER_INTERRUPTED.is_set()):
+                    time.sleep(0.2)
+            finally:
+                spinner.stop()
+        return self.deliver(messages)
+
+
+_BG_REVIEW = _BgReview()
 
 
 class _LoggingStream:
@@ -5051,10 +5380,12 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
     empty_turn_cuts = 0
     announced_stop_cuts = 0
     compress_failed = False
+    _BG_REVIEW.rounds = 0
     while steps < MAX_MODEL_TURNS:  # cap runaway tool/retry loops
         if _LIVE.active:
             _deliver_nudges(messages)
             _LIVE.esc_ended = False
+        _BG_REVIEW.step(messages)
         n_before = len(messages)
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
                             empty_turn_count=empty_turn_cuts,
@@ -5076,6 +5407,9 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
         if status == TURN_DONE:
             if _LIVE.active and not _LIVE.esc_ended and _LIVE.pending():
                 steps += 1  # a nudge arrived as the model finished: keep going
+                continue
+            if _BG_REVIEW.finish(messages):
+                steps += 1  # the background review found something: let the model look at it
                 continue
             break
         if status == TURN_ESC:
@@ -5131,6 +5465,8 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
             # A long autonomous run never returns to the REPL, where auto-
             # compress normally runs, so check between steps too. One failed
             # attempt is enough per run: each try is a full summary call.
+            if _LAST_PROMPT_TOKENS:
+                _BG_COMPACT.tick(messages, _estimate_context(_LAST_PROMPT_TOKENS, messages[n_before:]))
             if (not compress_failed and _LAST_PROMPT_TOKENS
                     and _feature("MINION_MIDRUN_COMPRESS")):
                 est = _estimate_context(_LAST_PROMPT_TOKENS, messages[n_before:])
@@ -6015,6 +6351,7 @@ def main():
         # fill threshold, silently fold the older turns so the chat can keep
         # going. Done after the save so the pre-compression state is on disk;
         # the compressed result is persisted by the _save_current() below.
+        _BG_COMPACT.tick(messages, _LAST_PROMPT_TOKENS)
         if _maybe_autocompress(messages, _LAST_PROMPT_TOKENS):
             _save_current()
         # Maybe refresh the model-generated description (a cheap non-streaming
