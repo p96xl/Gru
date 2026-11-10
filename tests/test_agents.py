@@ -59,12 +59,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import minion as m  # noqa: E402
 
 
-def _quiet(fn):
+def _quiet(fn, background=False):
     """Run with YOLO and with this file's mock server in the environment the agents inherit
-    (pytest imports every test file first, and later ones change MINION_BASE_URL)."""
+    (pytest imports every test file first, and later ones change MINION_BASE_URL).
+    Agents wait for their reports unless background=True."""
     saved_env, saved_yolo, saved_home = dict(os.environ), m.YOLO, m.SESSION_HOME
     for k in [k for k in os.environ if k.startswith("MINION_SOURCE")]:
         os.environ.pop(k)
+    os.environ["MINION_AGENT_BACKGROUND"] = "1" if background else "0"
     os.environ["MINION_BASE_URL"] = f"http://127.0.0.1:{_srv.server_port}/v1"
     os.environ["MINION_MODEL"] = "mock"
     m.YOLO, m.SESSION_HOME = True, _tmp
@@ -85,8 +87,8 @@ def test_parallel_agents_return_their_reports():
     t0 = time.time()
     out = _quiet(lambda: m.agent(tasks=["count the apples", "count the pears", "count the plums"], source="local"))
     took = time.time() - t0
-    for i, fruit in enumerate(("apples", "pears", "plums"), 1):
-        assert f"## Agent {i}: count the {fruit}" in out
+    for fruit in ("apples", "pears", "plums"):
+        assert f": count the {fruit}" in out
         assert f"REPORT: count the {fruit}" in out
     assert out.count("finished in") == 3
     assert _Model.peak >= 2, "agents did not run at the same time"
@@ -157,3 +159,89 @@ def test_agent_source_setting_picks_the_default():
         m.AGENT_SOURCE = saved[0]
         m.SOURCES.clear(); m.SOURCES.update(saved[1])
         m.SOURCE_ORDER[:] = saved[2]
+
+
+def test_shared_pool_split_between_agents_at_once():
+    saved = (m.AGENT_SHARED_CONTEXT, m.AGENT_CONTEXT_RESERVE, m.SOURCES["local"]._context_window)
+    m.AGENT_SHARED_CONTEXT, m.AGENT_CONTEXT_RESERVE = True, 4096
+    m.SOURCES["local"]._context_window = 65536 + 4096
+    try:
+        _Model.peak = 0
+        out = _quiet(lambda: m.agent(tasks=["one", "two"], source="local"))
+        assert out.count("context 32768 tokens") == 2 and _Model.peak == 2, out
+        _Model.peak = 0
+        out = _quiet(lambda: m.agent(tasks=["one", "two"], source="local", at_once=False))
+        assert out.count("context 65536 tokens") == 2 and _Model.peak == 1, out
+    finally:
+        m.AGENT_SHARED_CONTEXT, m.AGENT_CONTEXT_RESERVE, m.SOURCES["local"]._context_window = saved
+
+
+def test_agent_works_to_its_share():
+    env = dict(m._agent_child_env("local"), MINION_AGENT_CONTEXT="12345")
+    import subprocess
+    code = "import minion; print(minion.ACTIVE._context_window)"
+    res = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert res.stdout.strip().endswith("12345"), res.stdout + res.stderr
+
+
+def _history():
+    return [{"role": "system", "content": "sys"}, {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "a1", "type": "function", "function": {"name": "agent", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "a1", "content": "Started"}]
+
+
+def test_background_agents_return_at_once_and_report_later():
+    t0 = time.time()
+    out = _quiet(lambda: m.agent(tasks=["count the figs"], source="local"), background=True)
+    assert out.startswith("Started 1 agent in the background on local"), out
+    assert time.time() - t0 < _Model.delay, "the call waited for the agent"
+    msgs = _history()
+    deadline = time.time() + 60
+    while not m._BG_AGENTS.deliver(msgs):
+        assert time.time() < deadline, "no report arrived"
+        time.sleep(0.2)
+    note = msgs[-1]
+    assert note["role"] == "user" and note["content"].startswith("[Background agent report")
+    assert "REPORT: count the figs" in note["content"] and "finished in" in note["content"]
+    assert not m._BG_AGENTS.deliver(msgs)   # delivered once
+
+
+def test_finish_waits_for_agents_still_working():
+    _quiet(lambda: m.agent(tasks=["count the kiwis", "count the limes"], source="local"), background=True)
+    msgs = _history()
+    assert m._BG_AGENTS.busy() == 2
+    m._BG_AGENTS.nudged = False
+    assert m._BG_AGENTS.finish(msgs)            # first: told to keep working, no waiting
+    assert m._BG_AGENTS.busy() >= 1 and "don't sit idle" in msgs[-1]["content"]
+    assert m._BG_AGENTS.finish(msgs)            # then: waits and hands over the reports
+    assert m._BG_AGENTS.busy() == 0
+    text = msgs[-1]["content"]
+    assert "REPORT: count the kiwis" in text and "REPORT: count the limes" in text
+
+
+def test_background_queue_respects_the_parallel_limit():
+    _Model.peak = 0
+    saved = m.AGENT_PARALLEL
+    m.AGENT_PARALLEL = 1
+    try:
+        _quiet(lambda: m.agent(tasks=["a"], source="local"), background=True)
+        out = _quiet(lambda: m.agent(tasks=["b"], source="local"), background=True)
+        assert "1 other already working or queued" in out, out
+        msgs = _history()
+        m._BG_AGENTS.nudged = True
+        assert m._BG_AGENTS.finish(msgs)
+        while m._BG_AGENTS.busy():
+            time.sleep(0.2)
+        m._BG_AGENTS.deliver(msgs)
+    finally:
+        m.AGENT_PARALLEL = saved
+    assert _Model.peak == 1
+    text = "\n".join(x["content"] for x in msgs if x["role"] == "user")
+    assert "REPORT: a" in text and "REPORT: b" in text, text
+
+
+def test_wait_true_blocks_and_returns_reports():
+    out = _quiet(lambda: m.agent(tasks=["count the dates"], source="local", wait=True), background=True)
+    assert "REPORT: count the dates" in out and "finished in" in out

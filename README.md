@@ -19,11 +19,17 @@ in `~/.env`, or in the shell. `minion --features` shows what's on:
 | `MINION_ESC_IN_BASH` | Esc stops the agent while `run_bash` waits on a command |
 | `MINION_ESC_WHILE_WAITING` | Esc works while the server is still reading a long prompt |
 | `MINION_ANNOUNCED_STOP` | carry on when the model says "let me X:" and stops without a tool call |
+| `MINION_HELPER_DESC` | the `MINION_HELPER_SOURCE` model writes the session descriptions, so a one-slot main server (Strata) keeps the conversation cached |
+| `MINION_AGENT_BACKGROUND` | the `agent` tool returns at once and the agents work in the background (queued per `MINION_AGENT_PARALLEL`); each report is added as a note between steps, and a run that ends waits for agents still working. `wait=true` in the call blocks as before |
+| `MINION_GOAL` | `/goal <text>`: when the model ends its turn without replying `GOAL COMPLETE:` (or `NEED USER:`), it is told to keep going. Stops on Esc, a new message, 3 continuations in a row without a tool call, or `MINION_GOAL_MAX_ROUNDS` (default 50) |
+| `MINION_BROKEN_CALL` | retry when a reply is tool-call markup the server could not parse (e.g. `<function=` with no name) instead of ending the turn |
 | `MINION_MIDRUN_COMPRESS` | auto-compress between the steps of a long run, not only at the prompt |
 | `MINION_AGENTS` | `agent` tool: hand tasks to sub-agents that run at the same time |
 | `MINION_MCP_TOOLS` | tools from the MCP servers listed in the `MINION_MCP` file(s) |
 | `MINION_BG_COMPACT` | live compaction: the helper model summarizes old turns in the background |
+| `MINION_BG_COACH` | every `MINION_COACH_EVERY` tool steps (default 8) the `MINION_HELPER_SOURCE` model looks at the recent steps; if the model is going in circles it sends a short note with what to do differently (at most 4 per run). Never waited for |
 | `MINION_BG_REVIEW` | background review: the helper model reviews each edit while work goes on |
+| `MINION_REMOTE` | take messages from another program (a chat page) through a folder |
 
 ### Sub-agents
 
@@ -38,6 +44,13 @@ slots (`llama-server -np N`, Strata `--parallel N`); otherwise they queue.
 Agents use the current source unless `MINION_AGENT_SOURCE` names another, for example a
 second server on another card; the model can still pick any source per call, and the tool
 lists them. If the named source isn't there, agents fall back to the current one.
+
+When that server's slots share one context pool (`llama-server -np 2 --kv-unified`), set
+`MINION_AGENT_SHARED_CONTEXT=1`. An agent alone may then use the whole pool, agents running at
+once split it, and each one is told its share so its auto-compress keeps it inside. Going over
+fails every request on the server at once, so keep `MINION_AGENT_CONTEXT_RESERVE` tokens free for
+anything else that uses it, such as the helper's background jobs. The tool tells the model the
+sizes, and `at_once: false` runs several tasks one after another, each with the whole pool.
 
 ### A helper model beside the main one
 
@@ -98,6 +111,25 @@ model so the screenshots are reproducible.</sub>
 
 Turn it off with `MINION_LIVE_INPUT=0`. More in [Steering while it works](#steering-while-it-works).
 Branch: [`feat/live-nudge`](https://github.com/p96xl/minion/tree/feat/live-nudge).
+
+### Messages from another program
+
+An interactive minion also reads messages from a folder, `MINION_REMOTE_DIR` (default
+`~/.minion/remote`), so a chat page on your phone can talk to the session running in the
+terminal. A message that arrives while minion waits at its prompt is taken as if you typed
+it there (slash commands too); one that arrives while it works is delivered like a nudge.
+A message of just `/stop` works like Esc.
+
+- Senders write `inbox/<number>.msg`; minion takes them in number order.
+- minion keeps `state` up to date: `{"pid", "waiting", "taken", "ts"}`. A sender's message
+  has been handled once `taken` is at least its number and `waiting` is true again.
+- Only one minion serves a folder. Sub-agents and `--prompt-file` runs never do.
+- Messages left in the folder from before minion started are dropped.
+- Approval prompts are still answered only in the terminal, so for remote use run with
+  `--yolo` (in the box) or expect a message to wait until you're back.
+
+Sub-agents write their trace to `logs/llamacpp-agents.log`, so whatever follows
+`llamacpp.log` sees only the main conversation. Turn it off with `MINION_REMOTE=0`.
 
 ### Answers rendered as Markdown
 
@@ -414,6 +446,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `/delete [target]`  | delete a saved session                                  |
 | `/compress`         | summarize older turns into one, keep last 2 verbatim     |
 | `/compact`          | alias for `/compress`                                    |
+| `/goal [text\|off]` | set the goal minion works toward until the model reports `GOAL COMPLETE:` (or `NEED USER:`); no text shows it, `off` clears it. Saved with the session |
 | `/autocompress [pct\|off\|on]` | show or set the auto-compress threshold (default 85%; `0`/`off` disables) |
 | `/recover [note]`   | force a low-temp visible checkpoint after a bad stream   |
 | `/reset`            | clear conversation, start a fresh session               |
@@ -649,8 +682,8 @@ buffer, so the chat became unscrollable in a plain terminal.)
 
 ## Log
 
-Every request and streamed SSE chunk is appended to `llamacpp.log` next to the
-script (JSONL). Useful for debugging what the model actually saw and returned.
+Every request and streamed SSE chunk is appended to `logs/llamacpp.log` next to the
+script (JSONL); sub-agents use `logs/llamacpp-agents.log`. Useful for debugging what the model actually saw and returned.
 
 ## Metrics
 

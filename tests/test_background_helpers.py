@@ -28,7 +28,10 @@ class _Helper(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         _Helper.seen.append(req)
         prompt = req["messages"][-1]["content"]
-        if "running summary" in prompt:
+        if "stuck in a rut" in prompt:
+            text = ("1. Write the script to a file and run it instead of quoting it inline."
+                    if prompt.count("Syntax error") >= 3 else "OK")
+        elif "running summary" in prompt:
             n = sum(1 for r in _Helper.seen if "running summary" in r["messages"][-1]["content"])
             text = f"SUMMARY {n}" + (" (built on the last one)" if "Summary so far" in prompt else "")
         else:
@@ -151,3 +154,87 @@ def test_nothing_runs_without_a_separate_helper():
             assert not m._BG_REVIEW.enabled()
         finally:
             os.environ.pop("MINION_BG_REVIEW")
+
+
+def test_session_description_goes_to_the_helper():
+    """The one-line description is written by the helper in the background (so a one-slot
+    main server keeps the conversation cached) and saved at the next refresh check."""
+    class _NoMain:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kw):
+                    raise AssertionError("the main model must not write the description")
+    saved_client, saved_dir = m.client, os.environ.get("MINION_SESSIONS_DIR")
+    os.environ["MINION_SESSIONS_DIR"] = _tmp   # other test files change it; never write the real one
+    with _Setup():
+        m.client = _NoMain()
+        try:
+            sid = "20261109-120000-" + os.urandom(3).hex()
+            msgs = [{"role": "system", "content": "sys"}]
+            for i in range(m.SESSION_DESC_REFRESH):
+                msgs += [{"role": "user", "content": f"fix bug {i}"}, {"role": "assistant", "content": "ok"}]
+            m._write_session(sid, msgs, {})
+            assert m._maybe_refresh_description(sid, msgs) is None   # started in the background
+            assert sid in m._DESC_PENDING
+            m._DESC_PENDING[sid][0].join(10)
+            desc = m._maybe_refresh_description(sid, msgs)
+            assert desc and desc.startswith("The change is correct"), desc
+            assert m._load_session(sid)["description"] == desc
+            assert any(r["messages"][0]["content"] == m.DESC_SYSTEM for r in _Helper.seen)
+        finally:
+            m.client = saved_client
+            if saved_dir is None:
+                os.environ.pop("MINION_SESSIONS_DIR", None)
+            else:
+                os.environ["MINION_SESSIONS_DIR"] = saved_dir
+
+
+
+def _steps(n, error=False):
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "build the emulator"}]
+    for i in range(n):
+        msgs.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": "run_bash", "arguments": '{"command": "x"}'}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}",
+                     "content": "sh: 13: Syntax error: end of file unexpected" if error else f"ok step {i}"})
+    return msgs
+
+
+def _coach_round(msgs):
+    m._BG_COACH.__init__()
+    m._BG_COACH.step(msgs)
+    assert m._BG_COACH.thread is not None, "the coach did not look"
+    m._BG_COACH.thread.join(10)
+    n = len(msgs)
+    delivered = m._BG_COACH.deliver(msgs)
+    return delivered, msgs[n:] if len(msgs) > n else [msgs[-1]]
+
+
+def test_coach_stays_quiet_when_work_moves_on():
+    with _Setup():
+        msgs = _steps(m.COACH_EVERY)
+        n = len(msgs)
+        delivered, _ = _coach_round(msgs)
+        assert not delivered and len(msgs) == n
+
+
+def test_coach_sends_a_note_when_going_in_circles():
+    with _Setup():
+        msgs = _steps(m.COACH_EVERY, error=True)
+        delivered, _ = _coach_round(msgs)
+        assert delivered
+        note = msgs[-1]
+        assert note["role"] == "user" and note["content"].startswith("[Coach note")
+        assert "Write the script to a file" in note["content"]
+        assert any("stuck in a rut" in r["messages"][-1]["content"] for r in _Helper.seen)
+
+
+def test_coach_waits_for_enough_steps_and_sees_the_goal():
+    with _Setup():
+        m._BG_COACH.__init__()
+        msgs = _steps(m.COACH_EVERY - 1)
+        m._BG_COACH.step(msgs)
+        assert m._BG_COACH.thread is None
+        msgs[1]["content"] = "[Goal set by the user: a signed USB updater]\nWork toward this goal."
+        assert m._BG_COACH._aim(msgs) == "Goal: a signed USB updater"

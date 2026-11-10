@@ -35,11 +35,12 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /memory save|remember|list  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name] [model]  /provider [source] [a,b,…|off]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /goal [text|off]  /memory save|remember|list  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
        --features  (list this fork's additions and their on/off switches)
        MINION_MCP=<file.json>  (MCP servers, .mcp.json format; see "MCP servers" below)
        MINION_HELPER_SOURCE=<source>  (a second model for live compaction and edit review)
+       MINION_REMOTE_DIR=<dir>  (messages from a chat page, e.g. minion-watch; default ~/.minion/remote)
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
        MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
        MINION_BACKEND=vllm  (disables llama.cpp-only recovery knobs like min_p /
@@ -49,6 +50,8 @@ Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval 
        OPENROUTER_API_KEY  (auto-registers a built-in `openrouter` source; default model z-ai/glm-5.2,
             routed to parasail/fp8 — override with /provider or MINION_SOURCE_OPENROUTER_EXTRA_BODY)
 """
+import atexit
+import itertools
 import json
 import os
 import random
@@ -117,11 +120,17 @@ FEATURES = (
     ("MINION_ESC_IN_BASH", "1", "Esc stops the agent while run_bash waits on a command"),
     ("MINION_ESC_WHILE_WAITING", "1", "Esc works while the server is still reading a long prompt"),
     ("MINION_ANNOUNCED_STOP", "1", "carry on when the model says 'let me X:' then stops without a tool call"),
+    ("MINION_HELPER_DESC", "1", "the MINION_HELPER_SOURCE model writes the session descriptions, so the main server's cache keeps the conversation"),
+    ("MINION_GOAL", "1", "/goal <text>: keep working until the model reports the goal complete (or needs the user)"),
+    ("MINION_BROKEN_CALL", "1", "retry when a reply is tool-call markup the server could not parse (e.g. <function= with no name)"),
     ("MINION_MIDRUN_COMPRESS", "1", "auto-compress between the steps of a long run, not only at the prompt"),
     ("MINION_AGENTS", "1", "agent tool: hand tasks to sub-agents that run at the same time"),
+    ("MINION_AGENT_BACKGROUND", "1", "agents work in the background while the model keeps going; reports arrive as notes"),
     ("MINION_MCP_TOOLS", "1", "tools from the MCP servers listed in the MINION_MCP file(s)"),
     ("MINION_BG_COMPACT", "1", "live compaction: the MINION_HELPER_SOURCE model summarizes old turns in the background"),
+    ("MINION_BG_COACH", "1", "coach: the MINION_HELPER_SOURCE model looks at recent steps and sends a note when the model is stuck in a rut"),
     ("MINION_BG_REVIEW", "1", "background review: the MINION_HELPER_SOURCE model reviews each edit while work goes on"),
+    ("MINION_REMOTE", "1", "take messages from MINION_REMOTE_DIR (minion-watch's chat page): a prompt when idle, a nudge while working"),
 )
 _FEATURE_DEFAULTS = {name: default for name, default, _ in FEATURES}
 
@@ -430,6 +439,15 @@ def _maybe_refresh_description(session_id, messages):
     """
     if SESSION_DESC_REFRESH <= 0:
         return None
+    pending = _DESC_PENDING.get(session_id)
+    if pending is not None:
+        if pending[0].is_alive():
+            return None
+        del _DESC_PENDING[session_id]
+        desc = pending[1].get("desc")
+        if desc:
+            _write_session(session_id, messages, {"description": desc, "desc_turns": pending[2]})
+            return desc
     # Count user turns (exclude synthetic runtime-note-only turns).
     user_turns = sum(
         1 for m in messages
@@ -472,30 +490,59 @@ def _maybe_refresh_description(session_id, messages):
         {"role": "system", "content": DESC_SYSTEM},
         {"role": "user", "content": prompt},
     ]
-    try:
-        _log_event("req", {"model": MODEL, "messages": payload,
-                           "stream": False, "_purpose": "session_desc"})
-        resp = client.chat.completions.create(
-            model=MODEL, messages=payload, stream=False, timeout=20,
-            **(ACTIVE.extra_request_kwargs() if ACTIVE else {}))
-        try:
-            _log_event("resp", {"_purpose": "session_desc", "data": resp.model_dump()})
-        except Exception:
-            pass
-    except APIConnectionError:
-        return None  # server down — leave existing description as-is
-    except Exception:
+    # On a one-slot server (Strata) even this small request can push the conversation out of
+    # the cache, and the next turn re-reads all of it. With a helper, the helper writes it in
+    # the background (it may have to load first); the result is saved at the next refresh check.
+    helper = _helper_source() if _feature("MINION_HELPER_DESC") else None
+    if helper is not None:
+        holder = {}
+
+        def work():
+            holder["desc"] = _ask_description(helper, payload)
+
+        t = threading.Thread(target=work, daemon=True)
+        _DESC_PENDING[session_id] = (t, holder, user_turns)
+        t.start()
         return None
-    desc = (resp.choices[0].message.content or "").strip().splitlines()
-    desc = desc[0].strip() if desc else ""
+    desc = _ask_description(None, payload)
     if not desc:
         return None
-    desc = _safe_title(desc, maxlen=70) or desc[:70]
     # Persist the description + the turn count it was generated at so we know
     # when to refresh next. Merge into existing meta (don't clobber messages).
     _write_session(session_id, messages, {"description": desc,
                                           "desc_turns": user_turns})
     return desc
+
+
+_DESC_PENDING = {}   # session id -> (thread, {"desc": ...}, user turns) for helper-written descriptions
+
+
+def _ask_description(helper, payload):
+    """One description request, to the helper source or the main model. Returns the line or None."""
+    if helper is not None:
+        d_client, d_model = helper.client, helper.resolve_model()
+        body = dict(_NO_THINKING)
+        body.update((helper.extra_request_kwargs() or {}).get("extra_body") or {})
+        kwargs, timeout = {"extra_body": body}, 300
+    else:
+        d_client, d_model = client, MODEL
+        kwargs, timeout = (ACTIVE.extra_request_kwargs() if ACTIVE else {}), 20
+    try:
+        _log_event("req", {"model": d_model, "messages": payload, "stream": False,
+                           "_purpose": "session_desc", "_source": helper.name if helper else None})
+        resp = d_client.chat.completions.create(
+            model=d_model, messages=payload, stream=False, timeout=timeout, **kwargs)
+        try:
+            _log_event("resp", {"_purpose": "session_desc", "data": resp.model_dump()})
+        except Exception:
+            pass
+    except Exception:
+        return None  # server down or slow: leave the existing description as-is
+    desc = (resp.choices[0].message.content or "").strip().splitlines()
+    desc = desc[0].strip() if desc else ""
+    if not desc:
+        return None
+    return _safe_title(desc, maxlen=70) or desc[:70]
 
 
 def _resolve_session(target, sessions=None):
@@ -1247,7 +1294,11 @@ for _i, _arg in enumerate(sys.argv):
 # --- base-level traffic log -------------------------------------------------
 # Append-only JSONL record of every byte we ship to / receive from the server.
 # Lives next to this script so it's easy to find; rotate by hand if it gets big.
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "llamacpp.log")
+# Sub-agents log to their own file (fork), so a viewer following this one sees only the main
+# conversation; each agent's own screen output is in ~/.minion/agent-logs as well.
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs",
+                        "llamacpp-agents.log" if os.environ.get("MINION_AGENT_DEPTH", "0") not in ("", "0")
+                        else "llamacpp.log")
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 _llog = open(LOG_PATH, "a", buffering=1)  # line-buffered; flushes per write
 
@@ -2071,6 +2122,134 @@ class _LiveInput:
 _LIVE = _LiveInput()
 
 
+# --- remote input (fork) ----------------------------------------------------
+# Another program (minion-watch's chat page) talks to this minion through a folder,
+# MINION_REMOTE_DIR (default ~/.minion/remote, writable in the box):
+#   inbox/<number>.msg  a message. At the prompt minion takes it as if you typed it
+#                       (slash commands work); while the agent works it arrives like a
+#                       nudge. A message of just /stop works like Esc.
+#   state               JSON minion rewrites: {"pid", "waiting": at the prompt, "taken":
+#                       the number of the last message it took, "ts"}. The sender knows its
+#                       message was handled once taken >= its number and waiting is true.
+# Only one interactive minion serves a folder (a lock); sub-agents and --prompt-file never do.
+# Switch off with MINION_REMOTE=0.
+class _Remote:
+    POLL = 0.5
+
+    def __init__(self):
+        self.on = False
+        self.lock = threading.Lock()
+        self.queue = []          # (number, text)
+        self.taken = 0
+        self.waiting = False
+        self.session = None      # the open session's id, for the chat page's history
+        self.rfd = self.wfd = None
+        self.dir = None
+        self._lockf = None
+
+    def start(self):
+        """Begin serving the folder (main thread, before the REPL). Returns True if it did."""
+        if self.on or not _feature("MINION_REMOTE") or _PROMPT_FILE is not None:
+            return False
+        if _env_int("MINION_AGENT_DEPTH", 0) > 0:
+            return False
+        import fcntl
+        self.dir = os.path.expanduser(os.environ.get("MINION_REMOTE_DIR", "").strip()
+                                      or os.path.join(SESSION_HOME, "remote"))
+        try:
+            os.makedirs(os.path.join(self.dir, "inbox"), exist_ok=True)
+            self._lockf = open(os.path.join(self.dir, "lock"), "w")
+            fcntl.flock(self._lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if self._lockf is not None:
+                self._lockf.close()
+                self._lockf = None
+            return False  # another minion serves it (or the folder can't be used)
+        # Messages sent while no minion was running are old news: drop them.
+        for name in os.listdir(os.path.join(self.dir, "inbox")):
+            try:
+                os.remove(os.path.join(self.dir, "inbox", name))
+            except OSError:
+                pass
+        self.rfd, self.wfd = os.pipe()
+        os.set_blocking(self.rfd, False)
+        self.on = True
+        self._write_state()
+        threading.Thread(target=self._poll, daemon=True).start()
+        return True
+
+    def _write_state(self):
+        tmp = os.path.join(self.dir, f"state.{os.getpid()}")
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"pid": os.getpid(), "waiting": self.waiting, "taken": self.taken,
+                           "session": self.session, "ts": time.time()}, f)
+            os.replace(tmp, os.path.join(self.dir, "state"))
+        except OSError:
+            pass
+
+    def _poll(self):
+        inbox = os.path.join(self.dir, "inbox")
+        while True:
+            try:
+                names = sorted((n for n in os.listdir(inbox) if n.endswith(".msg")),
+                               key=lambda n: (len(n), n))
+            except OSError:
+                names = []
+            for name in names:
+                path = os.path.join(inbox, name)
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    os.remove(path)
+                    num = int(name[:-4])
+                except (OSError, ValueError):
+                    continue
+                with self.lock:
+                    if text.strip() == "/stop":
+                        self.taken = max(self.taken, num)
+                        if not self.waiting:
+                            _USER_INTERRUPTED.set()  # as if Esc was pressed
+                        self._write_state()
+                        continue
+                    self.queue.append((num, text))
+                try:
+                    os.write(self.wfd, b"x")
+                except OSError:
+                    pass
+            time.sleep(self.POLL)
+
+    def pending(self):
+        return self.on and bool(self.queue)
+
+    def take(self):
+        """All queued messages (oldest first); marks them taken and minion busy."""
+        if not self.on:
+            return []
+        with self.lock:
+            items, self.queue = self.queue, []
+            try:
+                while os.read(self.rfd, 4096):
+                    pass
+            except (BlockingIOError, OSError):
+                pass
+            if items:
+                self.taken = max([self.taken] + [n for n, _ in items])
+                self.waiting = False
+                self._write_state()
+        return [t for _, t in items]
+
+    def set_waiting(self, waiting, session=None):
+        if self.on and (waiting != self.waiting or (session and session != self.session)):
+            with self.lock:
+                self.waiting = waiting
+                self.session = session or self.session
+                self._write_state()
+
+
+_REMOTE = _Remote()
+
+
 class _live_paused:
     """Context manager: hand stdin back for an approval prompt during a live run.
     Disarms the watcher (waiting until it restored termios) and drops any
@@ -2112,11 +2291,15 @@ def _append_user_note(messages, note):
 def _deliver_nudges(messages):
     """Move queued nudges from the box into the conversation. Returns True if any."""
     items = _LIVE.drain()
-    if not items:
+    remote = _REMOTE.take()
+    if not items and not remote:
         return False
-    text = "\n".join(items)
     for line in items:
         print(f"{MAGENTA}  ↳ nudge: {line}{RESET}")
+    for line in remote:
+        print(f"{MAGENTA}  ↳ remote: {line}{RESET}")
+    items = items + remote
+    text = "\n".join(items)
     _log_event("nudge", text)
     _append_user_note(messages,
         "[Message from the user, typed while you were working. Take it into "
@@ -2620,11 +2803,18 @@ def _env_float(name, default):
 #   MINION_AGENT_REPORT_CHARS  longest report kept from each agent (default 6000)
 #   MINION_AGENT_SOURCE    the source agents use unless the model names one (default: the
 #                          current one), e.g. a second server on another card
+#   MINION_AGENT_SHARED_CONTEXT  1 when that server's slots share one context pool (llama-server
+#                          --kv-unified): an agent alone may use all of it, agents running at once
+#                          split it, and each is told its share (default 0: fixed slots)
+#   MINION_AGENT_CONTEXT_RESERVE  tokens of the pool kept free for other users of the server, e.g.
+#                          the background jobs of MINION_HELPER_SOURCE (default 0)
 AGENT_DEPTH = _env_int("MINION_AGENT_DEPTH", 0)  # set to 1 for the agents themselves
 AGENT_PARALLEL = max(1, _env_int("MINION_AGENT_PARALLEL", 4))
 AGENT_REPORT_CHARS = _env_int("MINION_AGENT_REPORT_CHARS", 6000)
 AGENT_MAX_TASKS = 8
 AGENT_SOURCE = os.environ.get("MINION_AGENT_SOURCE", "").strip()
+AGENT_SHARED_CONTEXT = _env_int("MINION_AGENT_SHARED_CONTEXT", 0) > 0
+AGENT_CONTEXT_RESERVE = _env_int("MINION_AGENT_CONTEXT_RESERVE", 0)
 AGENT_PREAMBLE = (
     "You are a sub-agent: another agent gave you the task below and is waiting for your "
     "report. Other agents may be working in the same folder at the same time, so only "
@@ -2637,16 +2827,45 @@ AGENT_TOOL = {"type": "function", "function": {
     "description": (
         "Hand tasks to sub-agents that work while you wait, then return their reports. Each agent "
         "starts with a fresh, empty context, has the same tools as you, and works in the same folder. "
-        "Several tasks run at the same time. Use it for independent pieces of work (investigate "
-        "one module each, try different fixes, write tests for separate files) or to keep long "
-        "searches out of your own context. Write each task so it stands alone: the agent sees "
-        "nothing of this conversation. Agents running at once must not edit the same files."),
+        "Use it to keep long reading, searching or writing out of your own context, or for "
+        "independent pieces of work (investigate one module each, try different fixes). Prefer ONE "
+        "agent with the whole job: agents running at the same time share one server, so each runs "
+        "slower, and you must then read and merge every report. Split only when the pieces are truly "
+        "independent and each is small. Write each task so it stands alone: the agent sees "
+        "nothing of this conversation. Agents running at once must not edit the same files."
+        "{context_note}"),
     "parameters": {"type": "object", "properties": {
         "tasks": {"type": "array", "items": {"type": "string"},
                   "description": f"one self-contained task per agent (at most {AGENT_MAX_TASKS})"},
         "source": {"type": "string",
                    "description": "optional: the source (server) the agents use; default: the current one"},
+        "at_once": {"type": "boolean",
+                    "description": "true (default): the tasks run at the same time. false: one after "
+                                   "another, so each agent gets the whole context"},
     }, "required": ["tasks"]}}}
+AGENT_BG_DESCRIPTION = (
+    "Hand tasks to sub-agents that work IN THE BACKGROUND on another server while you keep working: "
+    "the call returns at once, and each agent's report is added to the conversation as a note when "
+    "it is done. Use agents for work that can run beside yours: reading and summarizing long files "
+    "or docs, searching a codebase, investigating one module, checking an idea. Then keep going "
+    "with what needs you; don't sit idle and don't redo an agent's task. Each agent starts with a "
+    "fresh, empty context, has the same tools as you, and works in the same folder, so write each "
+    "task to stand alone (it sees nothing of this conversation) and never give it files you are "
+    "editing. The other server is slower than you, so give it self-contained side work, not the "
+    "next step you need. Prefer one agent per job. Set wait=true only when you cannot do anything "
+    "useful until the reports arrive: then the call blocks and returns them. If you finish while "
+    "agents are still working, their reports are waited for and given to you."
+    "{context_note}")
+AGENT_WAIT_PARAM = {"type": "boolean",
+                    "description": "false (default): return at once, reports arrive later as notes. "
+                                   "true: block until these agents finish and return their reports"}
+AGENT_CONTEXT_NOTE = (
+    " Agents share their server's context ({total} tokens): an agent working alone gets all of it, "
+    "agents working at the same time split it ({half} each for two). One agent with the whole "
+    "context suits a job that must read or keep a lot in mind; several at once suit independent "
+    "pieces that each need little. at_once=false runs several tasks one after another, each "
+    "with the whole context. On this setup one agent with a whole job has been about twice as fast "
+    "as the same job split across agents running at once.")
 
 
 def _agent_default_source():
@@ -2708,7 +2927,196 @@ def _stop_agent(p):
             pass
 
 
-def agent(tasks=None, source=None, task=None, **_):
+def _agent_pool(source):
+    """Tokens of the source's context pool agents may use, or None when it isn't shared/known."""
+    if not AGENT_SHARED_CONTEXT or source != (AGENT_SOURCE or source):
+        return None  # the setting describes the agent source's server only
+    src = SOURCES.get(source)
+    if src is None:
+        return None
+    total = src._context_window
+    if not isinstance(total, int) or total <= 0:
+        try:
+            total = src._ctx_from_models(src.resolve_model()) or src._ctx_from_props()
+        except Exception:  # noqa: BLE001 — unknown: agents then use whatever the server reports
+            total = None
+        if isinstance(total, int) and total > 0:
+            src._context_window = total
+    if not isinstance(total, int) or total <= 0:
+        return None
+    return max(4096, total - AGENT_CONTEXT_RESERVE)
+
+
+_AGENT_SEQ = itertools.count(1)
+
+
+def _agent_jobs(tasks, source, at_once):
+    """Write the task files and the environment for a batch of agents."""
+    log_dir = os.path.join(SESSION_HOME, "agent-logs")
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    env = _agent_child_env(source)
+    together = 1 if at_once is False or str(at_once).lower() == "false" else min(len(tasks), AGENT_PARALLEL)
+    pool = _agent_pool(source)
+    share = pool // together if pool else None
+    if share:
+        env["MINION_AGENT_CONTEXT"] = str(share)  # the child's auto-compress works to this size
+    jobs = []
+    for t in tasks:
+        i = next(_AGENT_SEQ)   # numbered across the session, so reports that arrive later are told apart
+        base = os.path.join(log_dir, f"{stamp}-{i}")
+        with open(base + ".task", "w", encoding="utf-8") as f:
+            f.write(AGENT_PREAMBLE + t)
+        jobs.append({"n": i, "task": t, "base": base, "proc": None, "start": None, "end": None,
+                     "source": source, "env": env, "share": share, "delivered": False,
+                     "approval": _agent_approval_args()})
+    return jobs, together
+
+
+def _agent_launch(j):
+    cmd = ([sys.executable, os.path.abspath(__file__), "--prompt-file", j["base"] + ".task",
+            "--source", j["source"]] + j["approval"])
+    child_env = dict(j["env"], MINION_RESULT_FILE=j["base"] + ".report")
+    with open(j["base"] + ".log", "w") as log:
+        j["proc"] = subprocess.Popen(cmd, cwd=os.getcwd(), env=child_env, stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    j["start"] = time.time()
+
+
+def _agent_result(j, stopped=False):
+    """One agent's section of the result: its state and its report."""
+    head = j["task"] if len(j["task"]) <= 100 else j["task"][:97] + "..."
+    p = j["proc"]
+    if p is None:
+        state = "not started (stopped by user)"
+    elif p.returncode in (0, None) and not stopped:
+        state = f"finished in {int((j['end'] or time.time()) - j['start'])}s"
+    else:
+        state = f"stopped (exit {p.returncode})"
+    report = _agent_report(j["base"] + ".report") if p is not None else ""
+    ctx = f"; context {j['share']} tokens" if j["share"] else ""
+    return (f"## Agent {j['n']}: {head}\n[{state} on {j['source']}{ctx}; full run: {j['base']}.log]\n"
+            + (report or "(no report)"))
+
+
+class _BgAgents:
+    """Agents working in the background: a thread starts queued ones (at most AGENT_PARALLEL at a
+    time) and notices finished ones; their reports go into the conversation between steps."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = []
+        self.thread = None
+        self.nudged = False      # told the model once, this run, to keep working while agents run
+
+    def add(self, jobs):
+        with self.lock:
+            self.jobs.extend(jobs)
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+
+    def _run(self):
+        while True:
+            with self.lock:
+                running = [j for j in self.jobs if j["proc"] is not None and j["end"] is None]
+                for j in running:
+                    if j["proc"].poll() is not None:
+                        j["end"] = time.time()
+                        print(f"{DIM}  ✓ background agent {j['n']} finished on {j['source']} "
+                              f"({int(j['end'] - j['start'])}s){RESET}")
+                running = [j for j in running if j["end"] is None]
+                queued = [j for j in self.jobs if j["proc"] is None and j["end"] is None]
+                for j in queued[:max(0, AGENT_PARALLEL - len(running))]:
+                    try:
+                        _agent_launch(j)
+                    except OSError as e:
+                        j["end"] = time.time()
+                        j["error"] = str(e)
+                if not running and not queued:
+                    self.thread = None
+                    return
+            time.sleep(0.5)
+
+    def busy(self):
+        with self.lock:
+            return sum(1 for j in self.jobs if j["end"] is None)
+
+    def deliver(self, messages):
+        """Add the reports of agents that finished since the last call. True if any."""
+        with self.lock:
+            done = [j for j in self.jobs if j["end"] is not None and not j["delivered"]]
+            for j in done:
+                j["delivered"] = True
+            self.jobs = [j for j in self.jobs if not j["delivered"]]
+            left = sum(1 for j in self.jobs if j["end"] is None)
+        if not done:
+            return False
+        parts = [_agent_result(j) if "error" not in j else
+                 f"## Agent {j['n']}: {j['task'][:100]}\n[could not start: {j['error']}]" for j in done]
+        print(f"{MAGENTA}  ↳ {len(done)} background agent report{'s' if len(done) > 1 else ''} "
+              f"added to the conversation{RESET}")
+        _append_user_note(messages,
+            "[Background agent report" + ("s" if len(done) > 1 else "")
+            + (f"; {left} agent{'s' if left > 1 else ''} still working" if left else "")
+            + ". Use what helps; check anything that matters before relying on it.]\n\n"
+            + "\n\n".join(parts))
+        return True
+
+    def wait(self, label):
+        """Block until all agents are done, Esc, or a new message from the user."""
+        if not self.busy():
+            return
+        spinner = LifeSpinner(label=label)
+        spinner.start()
+        try:
+            while (self.busy() and not _USER_INTERRUPTED.is_set() and not _REMOTE.pending()
+                   and not (_LIVE.active and _LIVE.pending())):
+                n = self.busy()
+                spinner.label = f"{label}: {n} working"
+                time.sleep(0.25)
+        finally:
+            spinner.stop()
+
+    def finish(self, messages):
+        """When the model says it's done: if agents are still working, first tell it so once,
+        so it goes on with other work instead of leaving the main server idle; the next time,
+        wait for them and hand over their reports. Returns True when the run should go on."""
+        if self.deliver(messages):
+            return True
+        if not self.busy():
+            return False
+        if not self.nudged:
+            self.nudged = True
+            with self.lock:
+                tasks = [j["task"] for j in self.jobs if j["end"] is None]
+            print(f"{YELLOW}  ↳ {len(tasks)} background agent{'s' if len(tasks) > 1 else ''} still working; "
+                  f"asking the model to go on with other work meanwhile{RESET}")
+            _append_user_note(messages,
+                f"[Runtime note: {len(tasks)} background agent{'s are' if len(tasks) > 1 else ' is'} still "
+                "working: " + "; ".join(t if len(t) <= 80 else t[:77] + "..." for t in tasks)
+                + ". You ended your turn, but don't sit idle: carry on now with any work that doesn't "
+                "need their reports (if you described a next step, do it). The reports will arrive as "
+                "notes. Only if nothing at all can be done without them, reply with one line saying so.]")
+            return True
+        self.wait("waiting for background agents")
+        return self.deliver(messages)
+
+    def stop_all(self):
+        with self.lock:
+            for j in self.jobs:
+                if j["proc"] is not None and j["end"] is None:
+                    _stop_agent(j["proc"])
+                    j["end"] = time.time()
+                elif j["proc"] is None:
+                    j["end"] = time.time()
+
+
+_BG_AGENTS = _BgAgents()
+atexit.register(_BG_AGENTS.stop_all)
+
+
+def agent(tasks=None, source=None, task=None, at_once=True, wait=None, **_):
     if isinstance(tasks, str):
         tasks = [tasks]
     tasks = [t.strip() for t in list(tasks or []) + ([task] if task else [])
@@ -2723,18 +3131,17 @@ def agent(tasks=None, source=None, task=None, **_):
     names = "; ".join(t if len(t) <= 70 else t[:67] + "..." for t in tasks)
     if not _confirm(f"start {len(tasks)} agent(s) on {source}: {names}"):
         return "DENIED by user"
-
-    log_dir = os.path.join(SESSION_HOME, "agent-logs")
-    os.makedirs(log_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
-    env = _agent_child_env(source)
-    me = [sys.executable, os.path.abspath(__file__)]
-    jobs = []
-    for i, t in enumerate(tasks, 1):
-        base = os.path.join(log_dir, f"{stamp}-{i}")
-        with open(base + ".task", "w", encoding="utf-8") as f:
-            f.write(AGENT_PREAMBLE + t)
-        jobs.append({"n": i, "task": t, "base": base, "proc": None, "start": None, "end": None})
+    jobs, together = _agent_jobs(tasks, source, at_once)
+    background = _feature("MINION_AGENT_BACKGROUND") and not (wait is True or str(wait).lower() == "true")
+    if background:
+        ahead = _BG_AGENTS.busy()
+        _BG_AGENTS.add(jobs)
+        share = jobs[0]["share"]
+        return (f"Started {len(jobs)} agent{'s' if len(jobs) > 1 else ''} in the background on {source}"
+                + (f" ({ahead} other{'s' if ahead > 1 else ''} already working or queued)" if ahead else "")
+                + (f"; context {share} tokens each" if share else "")
+                + ". Each report will be added to the conversation as a note when it is done. "
+                "Keep working on what doesn't depend on them; don't redo their tasks.")
 
     pending, running = list(jobs), []
     own_arm = (_feature("MINION_ESC_IN_BASH") and not _INTERRUPT_ARMED.is_set()
@@ -2747,14 +3154,9 @@ def agent(tasks=None, source=None, task=None, **_):
     interrupted = False
     try:
         while pending or running:
-            while pending and len(running) < AGENT_PARALLEL:
+            while pending and len(running) < together:
                 j = pending.pop(0)
-                cmd = me + ["--prompt-file", j["base"] + ".task", "--source", source] + _agent_approval_args()
-                child_env = dict(env, MINION_RESULT_FILE=j["base"] + ".report")
-                with open(j["base"] + ".log", "w") as log:
-                    j["proc"] = subprocess.Popen(cmd, cwd=os.getcwd(), env=child_env, stdin=subprocess.DEVNULL,
-                                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                j["start"] = time.time()
+                _agent_launch(j)
                 running.append(j)
             for j in list(running):
                 if j["proc"].poll() is not None:
@@ -2772,23 +3174,12 @@ def agent(tasks=None, source=None, task=None, **_):
         if own_arm:
             _INTERRUPT_ARMED.clear()
             _INTERRUPT_RESTORED.wait(timeout=0.5)
+        stopped = list(running)
         for j in running:
             _stop_agent(j["proc"])
             j["end"] = time.time()
 
-    out = []
-    for j in jobs:
-        head = j["task"] if len(j["task"]) <= 100 else j["task"][:97] + "..."
-        p = j["proc"]
-        if p is None:
-            state = "not started (stopped by user)"
-        elif p.returncode in (0, None) and not (interrupted and j in running):
-            state = f"finished in {int((j['end'] or time.time()) - j['start'])}s"
-        else:
-            state = f"stopped (exit {p.returncode})"
-        report = _agent_report(j["base"] + ".report") if p is not None else ""
-        out.append(f"## Agent {j['n']}: {head}\n[{state}; full run: {j['base']}.log]\n"
-                   + (report or "(no report)"))
+    out = [_agent_result(j, stopped=interrupted and j in stopped) for j in jobs]
     if interrupted:
         out.append("The user pressed Esc: unfinished agents were stopped.")
     return "\n\n".join(out)
@@ -2799,6 +3190,12 @@ if _feature("MINION_AGENTS") and AGENT_DEPTH == 0:
         sys.stderr.write(f"minion: MINION_AGENT_SOURCE={AGENT_SOURCE} is not a source here; "
                          "agents use the current one\n")
     AGENT_TOOL["function"]["parameters"]["properties"]["source"]["description"] = _agent_source_help()
+    _pool = _agent_pool(_agent_default_source())
+    if _feature("MINION_AGENT_BACKGROUND"):
+        AGENT_TOOL["function"]["description"] = AGENT_BG_DESCRIPTION
+        AGENT_TOOL["function"]["parameters"]["properties"]["wait"] = AGENT_WAIT_PARAM
+    AGENT_TOOL["function"]["description"] = AGENT_TOOL["function"]["description"].format(
+        context_note=AGENT_CONTEXT_NOTE.format(total=_pool, half=_pool // 2) if _pool else "")
     DISPATCH["agent"] = agent
     TOOLS.append(AGENT_TOOL)
 
@@ -3827,6 +4224,51 @@ def _confirm(action):
             sp.start()
 
 
+# --- /goal (fork; switch: MINION_GOAL) -----------------------------------------
+# The user sets a goal; whenever the model ends its turn without saying the goal is done or
+# that it needs the user, it is told to keep going. Stored in the session file ("goal").
+GOAL_DONE = "GOAL COMPLETE:"
+GOAL_NEED_USER = "NEED USER:"
+GOAL_MAX_ROUNDS = _env_int("MINION_GOAL_MAX_ROUNDS", 50)   # continuations per user message
+GOAL_IDLE_ROUNDS = 3   # continuations in a row with no tool call at all: it is stuck, stop
+
+
+def _goal_instructions(goal):
+    return (f"When the goal is fully done and you have checked it, reply starting with "
+            f"{GOAL_DONE} and the evidence. If you need the user for something only they can do "
+            f"(a decision, hardware, credentials), reply starting with {GOAL_NEED_USER} and the "
+            "question. Otherwise keep working: one concrete step after another.")
+
+
+def _goal_start_message(goal):
+    return f"[Goal set by the user: {goal}]\nWork toward this goal until it is fully done. " + _goal_instructions(goal)
+
+
+def _goal_nudge(goal, rounds):
+    return (f"[Runtime note: the goal is not marked done yet: {goal}\nYou ended your turn "
+            f"(continuation {rounds}). Don't summarize or stop: carry on with the next concrete step "
+            "toward the goal now. " + _goal_instructions(goal) + "]")
+
+
+def _goal_state(messages):
+    """How the last run ended: 'esc' (the user stopped it), 'done', 'user' (needs the user)
+    or None (it just stopped)."""
+    last = messages[-1] if messages else {}
+    if last.get("role") == "user" and "[User pressed Esc" in str(last.get("content") or ""):
+        return "esc"
+    for m in reversed(messages):
+        if m.get("role") == "user" and not str(m.get("content") or "").startswith("[Runtime note"):
+            break
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+            text = m["content"]
+            if GOAL_DONE in text:
+                return "done"
+            if GOAL_NEED_USER in text:
+                return "user"
+            return None
+    return None
+
+
 # --- text-fallback parsing --------------------------------------------------
 TOOL_TAG_PATTERN = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
 MINION_TOOL_TAG_PATTERN = r"\[minion_tool_call\]\s*(\{.*?\})\s*\[/minion_tool_call\]"
@@ -3838,6 +4280,27 @@ TOOL_RESULT_PROTOCOL_NOTE = (
     "[minion note: escaped tool-call protocol delimiters from this tool result "
     "before sending it back to the model]\n"
 )
+
+
+_FENCE_RE = re.compile(r"```.*?(```|$)", re.DOTALL)
+_CALL_MARKUP_RE = re.compile(r"<tool_call>|</tool_call>|<function=|</function>|<parameter=|</parameter>|"
+                             r"\[/?minion_tool_call\]")
+BROKEN_CALL_NUDGE = (
+    "Your last reply was tool-call markup that could not be parsed (for example a "
+    "<function= tag with no tool name), so no tool ran. Make that tool call again, "
+    "complete and well-formed, and keep going.")
+
+
+def _is_broken_call(text):
+    """True if the reply opens or closes with tool-call markup that did not parse:
+    a half-written call, not a mention of the tags inside prose or code."""
+    bare = _FENCE_RE.sub("", text or "").strip()
+    if not bare or not _CALL_MARKUP_RE.search(bare):
+        return False
+    first = _CALL_MARKUP_RE.match(bare)
+    last = any(bare.endswith(t) for t in ("</tool_call>", "</function>", "</parameter>",
+                                          "[/minion_tool_call]"))
+    return bool(first or last)
 
 
 def parse_text_calls(content):
@@ -4292,7 +4755,7 @@ BG_COMPACT_START = _env_int("MINION_BG_COMPACT_START", 50)
 BG_CHUNK_CHARS = _env_int("MINION_BG_CHUNK_CHARS", 60000)  # per helper call; ~17K tokens
 REVIEW_WAIT = _env_int("MINION_REVIEW_WAIT", 30)
 REVIEW_ROUNDS = 2       # review notes that may extend one run, so fix → review → fix can't loop
-REVIEW_DIFF_CHARS = 60000
+REVIEW_DIFF_CHARS = BG_CHUNK_CHARS  # both are sized to what the helper can take beside other work
 _NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}  # summaries and reviews don't need it
 
 
@@ -4575,6 +5038,97 @@ class _BgReview:
 _BG_REVIEW = _BgReview()
 
 
+COACH_EVERY = _env_int("MINION_COACH_EVERY", 8)   # tool steps between looks
+COACH_WINDOW = 24                                  # recent messages the coach sees
+COACH_NOTES = 4                                    # notes per run at most
+_GOAL_RE = re.compile(r"\[(?:Goal set by the user|Runtime note: the goal is not marked done yet): ?(.*?)(?:\]|\n)", re.S)
+
+
+class _BgCoach:
+    """Every few steps the helper looks at the recent ones and, if the model is going in circles
+    (the same error again, re-reading the same files, variations of a failing approach,
+    fighting its tools), sends a short note with what to do differently. Never waited for."""
+
+    def __init__(self):
+        self.thread = None
+        self.result = None
+        self.mark = 0            # len(messages) at the last look
+        self.notes = 0           # notes delivered in this run
+
+    def enabled(self):
+        return _feature("MINION_BG_COACH") and _helper_source() is not None
+
+    @staticmethod
+    def _aim(messages):
+        for m in reversed(messages):
+            c = m.get("content")
+            if m.get("role") == "user" and isinstance(c, str):
+                g = _GOAL_RE.search(c)
+                if g:
+                    return "Goal: " + g.group(1).strip()[:1500]
+        return "Task: " + _BgReview._task(messages)
+
+    def step(self, messages):
+        if not self.enabled():
+            return
+        self.deliver(messages)
+        if len(messages) < self.mark:
+            self.mark = len(messages)          # compacted
+        steps = sum(1 for m in messages[self.mark:] if m.get("role") == "assistant" and m.get("tool_calls"))
+        if self.thread is not None or steps < COACH_EVERY or self.notes >= COACH_NOTES:
+            return
+        self.mark = len(messages)
+        recent = _bg_render(messages[-COACH_WINDOW:])[-REVIEW_DIFF_CHARS:]
+        prompt = (
+            "You watch a coding agent's most recent steps while it keeps working. Decide whether it "
+            "is stuck in a rut: the same error again and again, re-reading the same files, small "
+            "variations of an approach that keeps failing, fighting its tools (for example shell "
+            "quoting), or many steps with no visible progress toward the aim. Long careful work that "
+            "moves forward is NOT a rut. If it is making progress, reply exactly: OK\n"
+            "If it is stuck, reply with at most 3 short, concrete suggestions: what to do "
+            "differently (a different method, a check of an assumption, a simpler step). No praise, "
+            "no summary of what it did.\n\n"
+            f"{self._aim(messages)}\n\nRecent steps:\n---\n{recent}\n---")
+        src = _helper_source()
+
+        def work():
+            try:
+                self.result = ("ok", _helper_ask(src, prompt, "bg-coach"))
+            except Exception as e:  # noqa: BLE001
+                self.result = ("error", f"{type(e).__name__}: {e}")
+
+        self.thread = threading.Thread(target=work, daemon=True)
+        self.thread.start()
+
+    def deliver(self, messages):
+        if self.thread is None or self.thread.is_alive():
+            return False
+        self.thread, result, self.result = None, self.result, None
+        if not result:
+            return False
+        kind, text = result
+        text = (text or "").strip()
+        if kind == "error":
+            print(f"{DIM}  coach on {HELPER_SOURCE} failed: {text}{RESET}")
+            return False
+        if not text or text.splitlines()[-1].strip(" *`.!").upper() == "OK":
+            print(f"{DIM}  ✓ {HELPER_SOURCE} coach: on track{RESET}")
+            return False
+        self.notes += 1
+        print(f"{MAGENTA}  ↳ coach note from {HELPER_SOURCE}:{RESET}")
+        for line in text.splitlines()[:8]:
+            print(f"{DIM}    {line[:160]}{RESET}")
+        _log_event("bg-coach", text)
+        _append_user_note(messages,
+            f"[Coach note from a second model ({HELPER_SOURCE}) that looked at your recent steps "
+            "and thinks you may be stuck. It can be wrong: use what helps, briefly say what you "
+            "change.]\n" + text)
+        return True
+
+
+_BG_COACH = _BgCoach()
+
+
 class _LoggingStream:
     """Iterator wrapper that tees each SSE chunk to llamacpp.log before yielding.
     Uses model_dump so we capture the chunk's full structure (incl. reasoning_content)."""
@@ -4648,6 +5202,11 @@ def _ctx_field(prompt_n):
 
 
 _CTX_PROBE_STARTED = set()  # id(Source) currently being probed (avoid dupe threads)
+
+# A sub-agent on a shared context pool works to the share the agent tool gave it (fork)
+if _env_int("MINION_AGENT_CONTEXT", 0) > 0 and AGENT_DEPTH > 0 and ACTIVE is not None:
+    ACTIVE._context_window = _env_int("MINION_AGENT_CONTEXT", 0)
+    _CTX_PROBE_STARTED.add(id(ACTIVE))
 
 
 def _ensure_ctx_probe(src):
@@ -5294,6 +5853,19 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         messages.append({"role": "user", "content": "\n".join(obs)})
         return TURN_TOOL
 
+    if not forced_final and _feature("MINION_BROKEN_CALL") and _is_broken_call(text):
+        retry_limit = max(0, MALFORMED_STREAM_RETRY_LIMIT)
+        if malformed_stream_cut_count >= retry_limit:
+            print(f"{RED}  ✗ broken tool call after "
+                  f"{malformed_stream_cut_count} recoveries — waiting for user input{RESET}")
+            messages.append({"role": "assistant", "content": text})
+            return TURN_DONE
+        print(f"{YELLOW}  ✂ BROKEN TOOL CALL — the reply was tool-call markup the server "
+              f"could not parse; discarded it and retrying "
+              f"({malformed_stream_cut_count + 1}/{retry_limit}){RESET}")
+        _nudge_current_user_turn(messages, BROKEN_CALL_NUDGE)
+        return TURN_STREAM_CUT
+
     if forced_final and text.strip() and "length" in finish_reasons:
         print(f"{YELLOW}  ✂ FORCED FINAL ANSWER HIT TOKEN LIMIT — saved partial answer "
               f"with truncation marker{RESET}")
@@ -5381,11 +5953,17 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
     announced_stop_cuts = 0
     compress_failed = False
     _BG_REVIEW.rounds = 0
+    _BG_AGENTS.nudged = False
+    _BG_COACH.notes = 0
     while steps < MAX_MODEL_TURNS:  # cap runaway tool/retry loops
         if _LIVE.active:
             _deliver_nudges(messages)
             _LIVE.esc_ended = False
+        elif _REMOTE.pending():
+            _deliver_nudges(messages)
         _BG_REVIEW.step(messages)
+        _BG_COACH.step(messages)
+        _BG_AGENTS.deliver(messages)
         n_before = len(messages)
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
                             empty_turn_count=empty_turn_cuts,
@@ -5408,8 +5986,17 @@ def _run_model_turn_steps(messages, force_final=False, recovery_sampling=False,
             if _LIVE.active and not _LIVE.esc_ended and _LIVE.pending():
                 steps += 1  # a nudge arrived as the model finished: keep going
                 continue
+            if _REMOTE.pending() and not _USER_INTERRUPTED.is_set():
+                steps += 1  # so did a remote message
+                continue
             if _BG_REVIEW.finish(messages):
                 steps += 1  # the background review found something: let the model look at it
+                continue
+            if _BG_AGENTS.finish(messages):
+                steps += 1  # background agents reported: let the model use the reports
+                continue
+            if _REMOTE.pending() and not _USER_INTERRUPTED.is_set():
+                steps += 1  # a message arrived while waiting for agents
                 continue
             break
         if status == TURN_ESC:
@@ -5773,6 +6360,19 @@ def _chatbox_raw(initial="", history=None):
     try:
         render()
         while True:
+            if _REMOTE.on:
+                ready, _, _ = select.select([fd, _REMOTE.rfd], [], [])
+                if fd not in ready:
+                    remote = _REMOTE.take()
+                    if not remote:
+                        continue
+                    text = "\n".join(remote)
+                    buf[:] = text.split("\n")
+                    row, col = len(buf) - 1, len(buf[-1])
+                    render()
+                    finish()
+                    print(f"{MAGENTA}  ↳ from the chat page{RESET}")
+                    return text
             c = _raw_read_key(fd)
             if c == "\x1b":
                 handle_escape(_raw_read_available(fd))
@@ -6060,12 +6660,19 @@ def main():
         if _METRICS is not None:
             _METRICS.flush()
 
+    if sys.stdin.isatty() and sys.stdout.isatty() and _REMOTE.start():  # the plain input() path can't be woken
+        print(f"{DIM}  remote: taking messages from {_REMOTE.dir}{RESET}")
     while True:
         try:
-            # Unsent text from the live nudge box pre-fills the chat input.
-            draft = _LIVE.take_leftover()
-            user = (read_multiline(initial=draft, history=history) if draft
-                    else read_multiline(history=history))
+            _REMOTE.set_waiting(True, session_id)
+            if _REMOTE.pending():  # sent while the last turn was finishing
+                user = "\n".join(_REMOTE.take())
+                print(f"{CYAN}you ›{RESET} {user}\n{MAGENTA}  ↳ from the chat page{RESET}")
+            else:
+                # Unsent text from the live nudge box pre-fills the chat input.
+                draft = _LIVE.take_leftover()
+                user = (read_multiline(initial=draft, history=history) if draft
+                        else read_multiline(history=history))
         except (EOFError, KeyboardInterrupt):
             print()
             # Flush the current session on Ctrl-D / Ctrl-C exit so the last
@@ -6080,6 +6687,7 @@ def main():
         user = user.strip()
         if not user:
             continue
+        _REMOTE.set_waiting(False)
         if user == "/quit":
             if session_dirty:
                 _save_current()
@@ -6321,6 +6929,19 @@ def main():
                     if saved.get("started_at"):
                         _METRICS.started_at = saved["started_at"]
             continue
+        if _feature("MINION_GOAL") and (user == "/goal" or user.startswith("/goal ")):
+            arg = user[len("/goal"):].strip()
+            current = ((_load_session(session_id) or {}).get("goal") or "").strip()
+            if not arg:
+                print(f"{DIM}  goal: {current or '(none)'}{RESET}")
+                continue
+            if arg.lower() in ("off", "clear", "none", "stop"):
+                _save_current({"goal": ""})
+                print(f"{DIM}  goal cleared{RESET}")
+                continue
+            _save_current({"goal": arg})
+            print(f"{MAGENTA}  ◎ goal set — working until it is done: {arg}{RESET}")
+            user = _goal_start_message(arg)
         if user == "/save" or user.startswith("/save "):
             title = user.split(None, 1)[1].strip() if " " in user else None
             _save_current({"title": title} if title else {})
@@ -6341,7 +6962,41 @@ def main():
             history.append(user)
         print()  # breathing room before the spinner/text starts
         messages.append({"role": "user", "content": user})
+        n_before = len(messages)
         _run_model_turn_loop(messages, on_step=_save_current)
+        goal_rounds = idle_rounds = 0
+        while _feature("MINION_GOAL"):
+            goal = ((_load_session(session_id) or {}).get("goal") or "").strip()
+            if not goal or _REMOTE.pending():
+                break   # no goal, or the user wrote something: that goes first
+            state = _goal_state(messages)
+            if state == "esc":
+                break
+            if state == "done":
+                _save_current({"goal": ""})
+                print(f"{GREEN}  ◎ goal complete{RESET}")
+                break
+            if state == "user":
+                print(f"{YELLOW}  ◎ goal paused: the model needs you (the goal stays set){RESET}")
+                break
+            idle_rounds = 0 if any(m.get("tool_calls") for m in messages[n_before:]) else idle_rounds + 1
+            if idle_rounds >= GOAL_IDLE_ROUNDS:
+                print(f"{YELLOW}  ◎ goal paused: {idle_rounds} continuations in a row without any "
+                      f"tool call (the goal stays set; say continue or /goal off){RESET}")
+                break
+            goal_rounds += 1
+            if goal_rounds > GOAL_MAX_ROUNDS:
+                print(f"{YELLOW}  ◎ goal paused after {GOAL_MAX_ROUNDS} continuations "
+                      f"(MINION_GOAL_MAX_ROUNDS); say continue to keep going{RESET}")
+                break
+            _save_current()
+            _BG_COMPACT.tick(messages, _LAST_PROMPT_TOKENS)
+            if _maybe_autocompress(messages, _LAST_PROMPT_TOKENS):
+                _save_current()
+            print(f"{MAGENTA}  ◎ goal not marked done — continuing ({goal_rounds}/{GOAL_MAX_ROUNDS}){RESET}")
+            _append_user_note(messages, _goal_nudge(goal, goal_rounds))
+            n_before = len(messages)
+            _run_model_turn_loop(messages, on_step=_save_current)
         # Auto-save after the turn settles (whether it ended cleanly, hit the
         # step cap, or was escaped). This is the Hermes pattern: persist every
         # turn so a crash / accidental close never loses work.
