@@ -1,0 +1,58 @@
+# minion.toml: the one config for everything in this folder. Copy this file to minion.toml and edit it,
+# or let setup_wizard.py write it. Paths may be relative to this file, so the folder works wherever the
+# drive is mounted. ~ means your home folder.
+#
+# Check it with:  python3 minion_config.py
+
+# Sessions, logs and locks. "./state" keeps them next to this file (on the drive) instead of in your home.
+state = "~/.minion"
+
+# The coding agent. Our minion.py by default; a stock minion.py also works, without the assistant roles.
+# agent = "minion.py"
+
+# ---------------------------------------------------------------------------------------------------------
+# Engines: the inference programs you have. One table each; the name is yours.
+#   kind = "llama.cpp"  server = path to llama-server, libs = folder for LD_LIBRARY_PATH (optional)
+#   kind = "strata"     home = Strata's folder (with terminal/ and components/)
+# ---------------------------------------------------------------------------------------------------------
+[engines.llama-vulkan]
+kind = "llama.cpp"
+server = "engines/llama-vulkan/llama-server"
+
+# [engines.llama-rocm]
+# kind = "llama.cpp"
+# server = "engines/llama-rocm/llama-server"
+# libs = "engines/llama-rocm"
+
+# [engines.strata]
+# kind = "strata"
+# home = "../strata"
+
+# ---------------------------------------------------------------------------------------------------------
+# Cards, in order: the first is the main one (runs the model you talk to), the second the assistant, ...
+#   pci      vendor:device from `lspci -nn` (e.g. [1002:73bf]); found by id, so slot changes don't matter
+#   engines  which engines may run on this card, preferred first
+#   models   folder of model folders for this card. Each model folder can hold:
+#              minion.conf   llama.cpp flags per context size, env, MINION_* switches, engine = <name>
+#              strata.json   Strata's full engine command line (for engine = strata)
+# ---------------------------------------------------------------------------------------------------------
+[cards.main]
+pci = "1002:73bf"
+engines = ["llama-vulkan"]
+models = "models"
+
+# The assistant card (used by assistant_gpu.py; ignored if that file is deleted). Roles name a model in
+# this card's models folder; "main" means the same model as main = ..., so no model swap is needed.
+# [cards.assistant]
+# pci = "1002:6863"
+# engines = ["llama-vulkan"]
+# models = "assistant-models"
+# main = "Some-Coder-30B-A3B-Q4_K_M"
+# review = "main"       # reviews each edit while the main model keeps working
+# coach = "main"        # rut detector: notices when the main model goes in circles
+# compact = "main"      # summarizes old turns so the context stays small
+# agents = "main"       # sub-agents
+# describe = "main"     # session titles
+# embed = "Qwen3-Embedding-0.6B-Q8_0"
+# rerank = "qwen3-reranker-0.6b-q8_0"
+# idle = 3600           # unload after this many seconds without a request

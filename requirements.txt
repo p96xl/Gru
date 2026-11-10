@@ -1,2 +1,0 @@
-openai
-httpx<0.28
