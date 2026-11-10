@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import engine_strata as es
-import minion_config as mc
+import gru_config as mc
 
 
 def make_home(tmp_path):
@@ -19,7 +19,7 @@ def make_home(tmp_path):
 
 
 def make_cfg(tmp_path, home):
-    p = tmp_path / "minion.toml"
+    p = tmp_path / "gru.toml"
     p.write_text(f'state = "./state"\n[engines.strata]\nkind = "strata"\nhome = "{home}"\n'
                  f'[cards.main]\npci = "1002:73bf"\nengines = ["strata"]\nmodels = "models"\n')
     return mc.load(str(p))

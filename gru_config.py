@@ -1,10 +1,10 @@
-"""minion_config.py: the one shared file. Every other script in this folder reads minion.toml through it.
+"""gru_config.py: the one shared file. Every other script in this folder reads gru.toml through it.
 
-  python3 minion_config.py            show the resolved config: engines, cards (found or not), parts present
-  python3 minion_config.py --check    same, and exit 1 if anything is wrong
+  python3 gru_config.py            show the resolved config: engines, cards (found or not), parts present
+  python3 gru_config.py --check    same, and exit 1 if anything is wrong
 
 What's here:
-  load()            minion.toml (next to this file, or $MINION_CONFIG) -> a plain dict with paths resolved
+  load()            gru.toml (next to this file, or $GRU_CONFIG) -> a plain dict with paths resolved
   find_card()       a PCI id like "1002:73bf" -> its bus address, hwmon folder and VRAM, read from /sys
   model_settings()  a model folder's minion.conf ("key = value" lines), layered over the models folder's own
   part_present()    whether an optional script (fan_curves, assistant_gpu, ...) is still in this folder
@@ -31,7 +31,7 @@ PARTS = {
     "thermal_guard": "stops a card's engine when it gets too hot",
     "fan_curves": "fan curves that follow GPU and CPU temperatures (needs root)",
     "web_ui": "chat page for your phone or LAN",
-    "setup_wizard": "one-time setup: cards, drivers, builds, minion.toml",
+    "setup_wizard": "one-time setup: cards, drivers, builds, gru.toml",
 }
 
 ENGINE_KINDS = ("llama.cpp", "strata")
@@ -44,30 +44,30 @@ class ConfigError(Exception):
 
 
 def config_path():
-    return os.path.abspath(os.path.expanduser(os.environ.get("MINION_CONFIG") or os.path.join(HERE, "minion.toml")))
+    return os.path.abspath(os.path.expanduser(os.environ.get("GRU_CONFIG") or os.path.join(HERE, "gru.toml")))
 
 
 def _path(base, p):
-    """~ expands to home; a relative path is relative to minion.toml's folder, so the SSD can mount anywhere."""
+    """~ expands to home; a relative path is relative to gru.toml's folder, so the SSD can mount anywhere."""
     p = os.path.expanduser(str(p))
     return os.path.normpath(p if os.path.isabs(p) else os.path.join(base, p))
 
 
 def load(path=None):
-    """Read and check minion.toml. Raises ConfigError with every problem found, not just the first."""
+    """Read and check gru.toml. Raises ConfigError with every problem found, not just the first."""
     path = path or config_path()
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
     except FileNotFoundError:
-        raise ConfigError(f"{path} doesn't exist. Copy minion.example.toml to minion.toml, or run setup_wizard.py")
+        raise ConfigError(f"{path} doesn't exist. Copy gru.example.toml to gru.toml, or run setup_wizard.py")
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: {e}")
     base = os.path.dirname(path)
     errors = []
     cfg = {k: v for k, v in raw.items() if k not in ("engines", "cards")}
     cfg["file"] = path
-    cfg["state"] = _path(base, raw.get("state", "~/.minion"))
+    cfg["state"] = _path(base, raw.get("state", "~/.gru"))
     cfg["agent"] = _path(base, raw.get("agent", "minion.py"))
 
     cfg["engines"] = {}
@@ -235,7 +235,7 @@ if __name__ == "__main__":
     try:
         cfg = load()
     except ConfigError as e:
-        print(f"minion_config: {e}", file=sys.stderr); sys.exit(1)
+        print(f"gru_config: {e}", file=sys.stderr); sys.exit(1)
     lines, problems = describe(cfg)
     print("\n".join(lines))
     if problems:

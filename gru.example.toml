@@ -1,11 +1,11 @@
-# minion.toml: the one config for everything in this folder. Copy this file to minion.toml and edit it,
+# gru.toml: the one config for everything in this folder. Copy this file to gru.toml and edit it,
 # or let setup_wizard.py write it. Paths may be relative to this file, so the folder works wherever the
 # drive is mounted. ~ means your home folder.
 #
-# Check it with:  python3 minion_config.py
+# Check it with:  python3 gru_config.py
 
-# Sessions, logs and locks. "./state" keeps them next to this file (on the drive) instead of in your home.
-state = "~/.minion"
+# Gru's logs and locks (minion keeps its sessions in ~/.minion). "./state" keeps them next to this file (on the drive) instead of in your home.
+state = "~/.gru"
 
 # The coding agent. Our minion.py by default; a stock minion.py also works, without the assistant roles.
 # agent = "minion.py"

@@ -4,7 +4,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import minion_config as mc
+import gru_config as mc
 
 
 def write(p, text):
@@ -35,7 +35,7 @@ idle = 3600
 
 
 def test_load_resolves_paths_relative_to_the_file(tmp_path):
-    cfg = mc.load(write(str(tmp_path / "minion.toml"), GOOD))
+    cfg = mc.load(write(str(tmp_path / "gru.toml"), GOOD))
     assert cfg["state"] == str(tmp_path / "state")
     assert cfg["engines"]["vk"]["server"] == str(tmp_path / "bin/llama-server")
     assert cfg["engines"]["strata"]["home"] == os.path.expanduser("~/strata")
@@ -57,15 +57,15 @@ engines = ["nope"]
 idle = 0
 """
     with pytest.raises(mc.ConfigError) as e:
-        mc.load(write(str(tmp_path / "minion.toml"), bad))
+        mc.load(write(str(tmp_path / "gru.toml"), bad))
     msg = str(e.value)
     for part in ("kind = 'vllm'", "needs server", "pci = '73bf'", "'nope'", "needs models", "idle = 0"):
         assert part in msg
 
 
 def test_missing_file_says_what_to_do(tmp_path):
-    with pytest.raises(mc.ConfigError, match="minion.example.toml"):
-        mc.load(str(tmp_path / "minion.toml"))
+    with pytest.raises(mc.ConfigError, match="gru.example.toml"):
+        mc.load(str(tmp_path / "gru.toml"))
 
 
 def fake_card(sysfs, bus, vendor, device, vram=None, hwmon=True):
@@ -117,7 +117,7 @@ def test_hold_shared_and_exclusive(tmp_path):
 
 
 def test_describe_flags_missing_things(tmp_path):
-    cfg = mc.load(write(str(tmp_path / "minion.toml"), GOOD))
+    cfg = mc.load(write(str(tmp_path / "gru.toml"), GOOD))
     fake_card(tmp_path / "sys", "0000:2d:00.0", "0x1002", "0x73bf", vram=16 * 2**30)
     lines, problems = mc.describe(cfg, str(tmp_path / "sys"))
     text = "\n".join(lines)

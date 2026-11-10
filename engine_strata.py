@@ -14,13 +14,13 @@ strata.json is the whole engine setup, nothing hidden:
   "gpu"         which GPU (Strata's numbering)
   "serve"       options for Strata's API server: {"parallel": 1, "shutdown_timeout": 30}
   everything else is passed to Strata's server as it is (tokenizer, model_name, ...)
-Inside any string, {strata} is the Strata folder from minion.toml and {model} is the model folder, so the
+Inside any string, {strata} is the Strata folder from gru.toml and {model} is the model folder, so the
 file keeps working when the drive is mounted somewhere else.
 
 How it runs: Strata's own server (terminal/<version>/serve/server.py) with that file, using the Python that
 ships in Strata's folder. `strata launch`, its presets in ~/.config/strata and its runtime are not used.
 The server restarts the engine by itself after a crash; `status` shows each restart and why.
-Logs: <state>/strata/<model>.server.log and <model>.engine.log (state is set in minion.toml).
+Logs: <state>/strata/<model>.server.log and <model>.engine.log (state is set in gru.toml).
 """
 import argparse
 import glob
@@ -33,7 +33,7 @@ import sys
 import time
 import urllib.request
 
-import minion_config as mc
+import gru_config as mc
 
 SERVE_DEFAULTS = {"parallel": 1, "shutdown_timeout": 30}
 
@@ -41,10 +41,10 @@ SERVE_DEFAULTS = {"parallel": 1, "shutdown_timeout": 30}
 def strata_home(cfg, name=None):
     engines = {n: e for n, e in cfg["engines"].items() if e["kind"] == "strata"}
     if not engines:
-        raise mc.ConfigError("minion.toml has no engine with kind = \"strata\"")
+        raise mc.ConfigError("gru.toml has no engine with kind = \"strata\"")
     if name:
         if name not in engines:
-            raise mc.ConfigError(f"no strata engine named {name!r} in minion.toml")
+            raise mc.ConfigError(f"no strata engine named {name!r} in gru.toml")
         return engines[name]["home"]
     return next(iter(engines.values()))["home"]
 
