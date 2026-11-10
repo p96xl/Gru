@@ -3873,12 +3873,16 @@ MANUAL_RECOVERY_NUDGE = (
 
 
 def _nudge_current_user_turn(messages, nudge):
+    """Attach a runtime note to the newest user turn when it is the last message. Otherwise
+    (tool results came after it) the note goes in a new user message at the end: editing an
+    old message would change the middle of the prompt and make the server re-read all of it."""
     note = f"[Runtime note: {nudge}]"
-    for msg in reversed(messages):
-        if msg.get("role") != "user" or not isinstance(msg.get("content"), str):
-            continue
-        content = RUNTIME_NOTE_RE.sub("", msg["content"]).rstrip()
-        msg["content"] = f"{content}\n\n{note}" if content else note
+    last = messages[-1] if messages else None
+    if last and last.get("role") == "user" and isinstance(last.get("content"), str):
+        content = RUNTIME_NOTE_RE.sub("", last["content"]).rstrip()
+        if content.startswith("[Runtime note: "):
+            content = ""
+        last["content"] = f"{content}\n\n{note}" if content else note
         return
     messages.append({"role": "user", "content": note})
 
@@ -4289,6 +4293,84 @@ BROKEN_CALL_NUDGE = (
     "Your last reply was tool-call markup that could not be parsed (for example a "
     "<function= tag with no tool name), so no tool ran. Make that tool call again, "
     "complete and well-formed, and keep going.")
+
+
+_XML_FUNC_RE = re.compile(r"<function=([A-Za-z0-9_.:-]+)>")
+_XML_PARAM_RE = re.compile(r"<parameter=([A-Za-z0-9_.:-]+)>")
+_XML_CALL_ALIASES = {
+    "bash": "run_bash", "shell": "run_bash", "sh": "run_bash", "run_shell": "run_bash",
+    "execute": "run_bash", "exec": "run_bash", "terminal": "run_bash", "run_command": "run_bash",
+    "read": "read_file", "cat": "read_file", "write": "write_file", "edit": "edit_file",
+    "ls": "list_dir", "list": "list_dir",
+}
+_XML_JUNK_CLOSERS = {"parameter", "function", "tool_call", "invoke", "function_calls", "parameters"}
+
+
+def _tool_schema(name):
+    for t in TOOLS:
+        fn = t.get("function") or {}
+        if fn.get("name") == name:
+            return fn.get("parameters") or {}
+    return None
+
+
+def _salvage_xml_calls(text):
+    """Repair Qwen-style XML tool calls with wrong closing tags, e.g.
+        <tool_call><function=bash><parameter=command>ls</bash></invoke>
+    -> [("run_bash", {"command": "ls"})]. Only when the whole reply is the call, the tool
+    exists, and every argument name is one the tool takes; anything less returns []."""
+    bare = (text or "").strip()
+    if bare.startswith("<tool_call>"):
+        bare = bare[len("<tool_call>"):].lstrip()
+    if not bare.startswith("<function="):
+        return []
+    starts = [m for m in _XML_FUNC_RE.finditer(bare)]
+    calls = []
+    for i, m in enumerate(starts):
+        block = bare[m.end():starts[i + 1].start() if i + 1 < len(starts) else len(bare)]
+        raw = m.group(1)
+        name = raw if _tool_schema(raw) is not None else _XML_CALL_ALIASES.get(raw.lower(), raw)
+        schema = _tool_schema(name)
+        if schema is None:
+            return []
+        props = schema.get("properties") or {}
+        closers = _XML_JUNK_CLOSERS | {raw, name}
+        params = list(_XML_PARAM_RE.finditer(block))
+        if not params or block[:params[0].start()].strip():
+            return []
+        args = {}
+        for j, pm in enumerate(params):
+            key = pm.group(1)
+            if key not in props:
+                return []
+            val = block[pm.end():params[j + 1].start() if j + 1 < len(params) else len(block)]
+            if "</parameter>" in val:
+                val, rest = val.split("</parameter>", 1)
+                if re.sub(r"</?([A-Za-z0-9_.:=-]+)>", lambda t: "" if t.group(1).split("=")[0] in closers else t.group(0), rest).strip():
+                    return []
+            else:
+                closed = False   # strip trailing protocol closers like </bash></invoke>
+                while True:
+                    t = re.search(r"</([A-Za-z0-9_.:-]+)>\s*$", val)
+                    if not t or t.group(1) not in closers:
+                        break
+                    val, closed = val[:t.start()], True
+                if not closed and j + 1 == len(params):
+                    return []    # cut off mid-argument: never run half a command
+            if val.startswith("\n"):
+                val = val[1:]
+            if val.endswith("\n"):
+                val = val[:-1]
+            if (props[key].get("type") in ("integer", "number", "boolean", "array", "object")):
+                try:
+                    val = json.loads(val)
+                except json.JSONDecodeError:
+                    return []
+            args[key] = val
+        if any(r not in args for r in schema.get("required", [])):
+            return []
+        calls.append((name, args))
+    return calls
 
 
 def _is_broken_call(text):
@@ -5773,6 +5855,17 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         print(f"{RED}  ✂ FORCED FINAL ANSWER FAILED — model emitted {names}; "
               f"returning to chat input{RESET}")
         return TURN_DONE
+
+    if not tcs and not forced_final and _feature("MINION_BROKEN_CALL"):
+        fixed = _salvage_xml_calls(text)
+        if fixed:
+            # Run it as a proper native call, and keep the history native, so the model
+            # sees a well-formed call next time instead of copying its own bad markup.
+            print(f"{YELLOW}  ⚒ repaired a malformed tool call "
+                  f"({', '.join(n for n, _ in fixed)}) and ran it{RESET}")
+            tcs = {i: {"id": f"call_fix_{secrets.token_hex(6)}", "name": n, "args": json.dumps(a)}
+                   for i, (n, a) in enumerate(fixed)}
+            text = ""
 
     if tcs:  # native tool-calling path
         ordered = [tcs[i] for i in sorted(tcs)]
